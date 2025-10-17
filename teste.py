@@ -26,8 +26,8 @@ except Exception:
 NUM_AP = 4
 USERS_PER_AP = 10
 TOTAL_USERS = NUM_AP * USERS_PER_AP
-EPOCHS_LOCAL = 2
-EPOCHS_GLOBAL = 4
+EPOCHS_LOCAL = 5
+EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
 
 # Se False, subamostra k usuários por AP por rodada
