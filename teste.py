@@ -1,4 +1,4 @@
-import random
+import os, random
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.datasets import cifar10
@@ -7,41 +7,65 @@ from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from sklearn.model_selection import train_test_split
 
 # -------------------------
-# Sementes fixas
+# Sementes / determinismo
 # -------------------------
 SEED = 42
+os.environ["PYTHONHASHSEED"] = "0"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+try:
+    tf.config.experimental.enable_op_determinism(True)
+except Exception:
+    pass
 
 # -------------------------
-# Configurações iniciais
+# Configurações
 # -------------------------
-NUM_AP = 4                # Número de Access Points
-USERS_PER_AP = 10         # Usuários por AP
+NUM_AP = 4
+USERS_PER_AP = 10
 TOTAL_USERS = NUM_AP * USERS_PER_AP
 EPOCHS_LOCAL = 2
-EPOCHS_GLOBAL = 3
+EPOCHS_GLOBAL = 4
 BATCH_SIZE = 64
 
+# Se False, subamostra k usuários por AP por rodada
+USE_ALL_USERS_PER_AP = True
+K_PER_AP = 2  # usado se USE_ALL_USERS_PER_AP = False
+
+# RNG único para todo o script (evita repetir seleção)
+rng = np.random.default_rng(SEED)
+
 # -------------------------
-# Carregar CIFAR-10 e dividir entre usuários
+# Dados
 # -------------------------
 (x_train, y_train), (x_test, y_test) = cifar10.load_data()
-x_train, x_test = x_train / 255.0, x_test / 255.0
+x_train = x_train.astype("float32")/255.0
+x_test  = x_test.astype("float32")/255.0
 
-# Reduzir base para facilitar simulação
-x_train, _, y_train, _ = train_test_split(x_train, y_train, train_size=TOTAL_USERS * 100, stratify=y_train, random_state=SEED,shuffle=True)
+x_train, _, y_train, _ = train_test_split(
+    x_train, y_train,
+    train_size=TOTAL_USERS * 100,  # 100 amostras por usuário
+    stratify=y_train,
+    random_state=SEED,
+    shuffle=True
+)
 
-# Dividir para os usuários
+# Fatias por usuário
 user_data = []
 for i in range(TOTAL_USERS):
-    x_user = x_train[i*100:(i+1)*100]
-    y_user = y_train[i*100:(i+1)*100]
-    user_data.append((x_user, y_user))
+    s, e = i*100, (i+1)*100
+    user_data.append((x_train[s:e], y_train[s:e]))
+
+# Índices de usuários por AP
+ap_users = {
+    ap: list(range(ap*USERS_PER_AP, (ap+1)*USERS_PER_AP))
+    for ap in range(NUM_AP)
+}
 
 # -------------------------
-# Modelo base (CNN)
+# Modelo base
 # -------------------------
 def build_model():
     model = Sequential([
@@ -57,42 +81,77 @@ def build_model():
     return model
 
 # -------------------------
-# Simular métrica de canal e seleção de usuários
+# Agregações (FedAvg)
 # -------------------------
-def select_users_by_ap():
-    rng = np.random.default_rng(SEED)
-    channel_quality = rng.random((NUM_AP, USERS_PER_AP)) # Simula qualidade de canal
-    selected_users = np.argmax(channel_quality, axis=1)      # Um usuário com melhor canal por AP
-    user_ids = [ap * USERS_PER_AP + selected_users[ap] for ap in range(NUM_AP)]
-    return user_ids
+def fedavg(weights_list, sizes):
+    """ Soma ponderada por n_i / N, camada a camada. """
+    N = float(np.sum(sizes))
+    new_weights = []
+    for layer_ws in zip(*weights_list):
+        stack = np.stack(layer_ws, axis=0)  # (num_models, ...)
+        coeffs = (np.array(sizes)/N).reshape((-1,) + (1,)*(stack.ndim-1))
+        new_weights.append(np.sum(coeffs * stack, axis=0))
+    return new_weights
 
 # -------------------------
-# Federated Learning Loop
+# Seleção de usuários por AP (por rodada)
+# -------------------------
+def select_users_for_ap(ap, round_idx):
+    users = ap_users[ap]
+    if USE_ALL_USERS_PER_AP:
+        return users
+    # Subamostragem (aleatória e justa)
+    if K_PER_AP >= len(users):
+        return users
+    # escolhe K_PER_AP usuários diferentes a cada rodada (random sem reposição)
+    return list(rng.choice(users, size=K_PER_AP, replace=False))
+
+# -------------------------
+# Loop Federado Hierárquico: Usuários -> AP -> Servidor
 # -------------------------
 global_model = build_model()
 
-for round in range(EPOCHS_GLOBAL):
-    print(f"\n🔁 Rodada Federada {round+1}")
-    
-    #selected_user_ids = select_users_by_ap()
-    # Aqui usamos todos os usuários diretamente
-    selected_user_ids = list(range(TOTAL_USERS))
-    weights = []
-    
-    for uid in selected_user_ids:
-        local_model = build_model()
-        local_model.set_weights(global_model.get_weights())
-        
-        x_u, y_u = user_data[uid]
-        local_model.fit(x_u, y_u, epochs=EPOCHS_LOCAL, batch_size=BATCH_SIZE, verbose=0, shuffle=False)
-        weights.append(local_model.get_weights())
-    
-    # Média dos pesos (FedAvg)
-    new_weights = []
-    for layer_weights in zip(*weights):
-        new_weights.append(np.mean(layer_weights, axis=0))
-    
-    global_model.set_weights(new_weights)
+for r in range(EPOCHS_GLOBAL):
+    print(f"\n🔁 Rodada Federada {r+1}")
+    ap_models_weights = []
+    ap_sizes = []
+
+    # 1) Cada AP coordena seus usuários e faz uma agregação local
+    for ap in range(NUM_AP):
+        selected_user_ids = select_users_for_ap(ap, r)
+        local_weights_list = []
+        local_sizes = []
+
+        for uid in selected_user_ids:
+            # cada usuário começa do modelo global
+            local_model = build_model()
+            local_model.set_weights(global_model.get_weights())
+
+            x_u, y_u = user_data[uid]
+            local_model.fit(
+                x_u, y_u,
+                epochs=EPOCHS_LOCAL,
+                batch_size=BATCH_SIZE,
+                verbose=0,
+                shuffle=False,
+                workers=1, use_multiprocessing=False
+            )
+
+            local_weights_list.append(local_model.get_weights())
+            local_sizes.append(len(x_u))  # aqui: 100 por usuário
+
+        # Agregação no AP (modelo do AP)
+        ap_weights = fedavg(local_weights_list, local_sizes)
+        ap_models_weights.append(ap_weights)
+        ap_sizes.append(np.sum(local_sizes))  # total de amostras desse AP
+
+    # 2) Servidor agrega os modelos dos APs (FedAvg global)
+    new_global_weights = fedavg(ap_models_weights, ap_sizes)
+    global_model.set_weights(new_global_weights)
+
+    # (Opcional) Acompanhar evolução
+    loss_r, acc_r = global_model.evaluate(x_test, y_test, verbose=0)
+    print(f"   ↳ após agregação dos APs: acc={acc_r*100:.2f}%")
 
 # -------------------------
 # Avaliação final
