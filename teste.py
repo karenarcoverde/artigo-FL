@@ -1,9 +1,18 @@
+import random
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.datasets import cifar10
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from sklearn.model_selection import train_test_split
+
+# -------------------------
+# Sementes fixas
+# -------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 # -------------------------
 # Configurações iniciais
@@ -22,7 +31,7 @@ BATCH_SIZE = 64
 x_train, x_test = x_train / 255.0, x_test / 255.0
 
 # Reduzir base para facilitar simulação
-x_train, _, y_train, _ = train_test_split(x_train, y_train, train_size=TOTAL_USERS * 100, stratify=y_train)
+x_train, _, y_train, _ = train_test_split(x_train, y_train, train_size=TOTAL_USERS * 100, stratify=y_train, random_state=SEED,shuffle=True)
 
 # Dividir para os usuários
 user_data = []
@@ -51,7 +60,8 @@ def build_model():
 # Simular métrica de canal e seleção de usuários
 # -------------------------
 def select_users_by_ap():
-    channel_quality = np.random.rand(NUM_AP, USERS_PER_AP)  # Simula qualidade de canal
+    rng = np.random.default_rng(SEED)
+    channel_quality = rng.random((NUM_AP, USERS_PER_AP)) # Simula qualidade de canal
     selected_users = np.argmax(channel_quality, axis=1)      # Um usuário com melhor canal por AP
     user_ids = [ap * USERS_PER_AP + selected_users[ap] for ap in range(NUM_AP)]
     return user_ids
@@ -64,7 +74,9 @@ global_model = build_model()
 for round in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {round+1}")
     
-    selected_user_ids = select_users_by_ap()
+    #selected_user_ids = select_users_by_ap()
+    # Aqui usamos todos os usuários diretamente
+    selected_user_ids = list(range(TOTAL_USERS))
     weights = []
     
     for uid in selected_user_ids:
@@ -72,7 +84,7 @@ for round in range(EPOCHS_GLOBAL):
         local_model.set_weights(global_model.get_weights())
         
         x_u, y_u = user_data[uid]
-        local_model.fit(x_u, y_u, epochs=EPOCHS_LOCAL, batch_size=BATCH_SIZE, verbose=0)
+        local_model.fit(x_u, y_u, epochs=EPOCHS_LOCAL, batch_size=BATCH_SIZE, verbose=0, shuffle=False)
         weights.append(local_model.get_weights())
     
     # Média dos pesos (FedAvg)
