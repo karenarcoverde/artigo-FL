@@ -33,11 +33,9 @@ EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
 
 # Se False, subamostra k usuários por AP por rodada
+USE_ALL_USERS_PER_AP = True
+K_PER_AP = 2 # usado se USE_ALL_USERS_PER_AP = False
 
-##########
-USE_ALL_USERS_PER_AP = False
-K_PER_AP = 4  # usado se USE_ALL_USERS_PER_AP = False
-#############
 
 # RNG único para todo o script (evita repetir seleção)
 rng = np.random.default_rng(SEED)
@@ -57,12 +55,6 @@ x_train, _, y_train, _ = train_test_split(
     shuffle=True
 )
 
-# Pequeno conjunto de validação compartilhado (p.ex., 2k amostras do teste)
-#####################
-VAL_SAMPLES = 2000
-x_val = x_test[:VAL_SAMPLES]
-y_val = y_test[:VAL_SAMPLES]
-####################
 
 # Fatias por usuário
 user_data = []
@@ -92,61 +84,7 @@ def build_model():
                   metrics=['accuracy'])
     return model
 
-#########################
-# APRENDIZADO POR REFORÇO
-######################
-class BanditSelector:
-    """
-    UCB1 por AP: cada 'braço' é um UE do AP.
-    reward ~ acc no val set (0..1) do modelo local treinado daquele UE.
-    """
-    def __init__(self, ap_to_users, c=1.5):
-        self.c = c
-        self.t = defaultdict(int)            # passos por AP
-        self.n = defaultdict(lambda: defaultdict(int))   # pulls[ap][uid]
-        self.q = defaultdict(lambda: defaultdict(float)) # mean reward[ap][uid]
-        self.ap_to_users = ap_to_users
 
-    def select(self, ap, k):
-        users = self.ap_to_users[ap]
-        # Primeiro garante 1 pull para cada UE (fase de "warm-up")
-        cold = [u for u in users if self.n[ap][u] == 0]
-        if len(cold) >= k:
-            return cold[:k]
-
-        chosen = list(cold)  # pega os "virgens" primeiro
-        # UCB para o restante
-        self.t[ap] += 1
-        T = max(1, self.t[ap])
-        candidates = [u for u in users if self.n[ap][u] > 0]
-        if candidates:
-            scores = []
-            for u in candidates:
-                mean = self.q[ap][u]
-                bonus = self.c * math.sqrt(math.log(T) / self.n[ap][u])
-                scores.append((mean + bonus, u))
-            scores.sort(reverse=True)
-            for _, u in scores:
-                if len(chosen) < k:
-                    chosen.append(u)
-                else:
-                    break
-        # Se ainda faltar, completa (deve ser raro)
-        if len(chosen) < k:
-            rest = [u for u in users if u not in chosen]
-            chosen += rest[:(k - len(chosen))]
-        return chosen
-
-    def update(self, ap, uid, reward):
-        # incremental mean
-        n_old = self.n[ap][uid]
-        q_old = self.q[ap][uid]
-        n_new = n_old + 1
-        q_new = q_old + (reward - q_old) / n_new
-        self.n[ap][uid] = n_new
-        self.q[ap][uid] = q_new
-
-#####################################
 
 # -------------------------
 # Agregações (FedAvg)
@@ -162,16 +100,18 @@ def fedavg(weights_list, sizes):
     return new_weights
 
 
-# Instância global do bandit (um por script)
-bandit = BanditSelector(ap_users, c=1.5)
-
+# -------------------------
+# Seleção de usuários por AP (por rodada)
+# -------------------------
 def select_users_for_ap(ap, round_idx):
     users = ap_users[ap]
     if USE_ALL_USERS_PER_AP:
         return users
-    k = min(K_PER_AP, len(users))
-    return bandit.select(ap, k)
-
+    # Subamostragem (aleatória e justa)
+    if K_PER_AP >= len(users):
+        return users
+    # escolhe K_PER_AP usuários diferentes a cada rodada (random sem reposição)
+    return list(rng.choice(users, size=K_PER_AP, replace=False))
 
 # -------------------------
 # Loop Federado Hierárquico: Usuários -> AP -> Servidor
@@ -202,15 +142,6 @@ for r in range(EPOCHS_GLOBAL):
                 verbose=0,
                 shuffle=False
             )
-
-            #############
-            # Recompensa = acc no val set (proxy de generalização)
-            _, acc_u = local_model.evaluate(x_val, y_val, verbose=0)
-            reward = float(acc_u)  # 0..1
-
-            #Atualiza o bandit do AP com a recompensa desse UE
-            bandit.update(ap, uid, reward)
-            #################
 
             local_weights_list.append(local_model.get_weights())
             local_sizes.append(len(x_u))  # aqui: 100 por usuário
