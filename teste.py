@@ -32,15 +32,10 @@ EPOCHS_LOCAL = 5
 EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
 
-# Se False, subamostra k usuários por AP por rodada
-
-##########
-USE_ALL_USERS_PER_AP = False
-K_PER_AP = 4  # usado se USE_ALL_USERS_PER_AP = False
-#############
-
-# RNG único para todo o script (evita repetir seleção)
-rng = np.random.default_rng(SEED)
+# Bandit-weighted FedAvg
+VAL_SAMPLES = 5000          # maior val-set -> recompensa mais estável
+LAMBDA_OVERFIT = 0.15       # 0.1–0.3 funciona bem
+WEIGHT_FLOOR, WEIGHT_CEIL = 0.5, 1.5  # faixa de pesos na agregação por AP
 
 # -------------------------
 # Dados
@@ -57,12 +52,9 @@ x_train, _, y_train, _ = train_test_split(
     shuffle=True
 )
 
-# Pequeno conjunto de validação compartilhado (p.ex., 2k amostras do teste)
-#####################
-VAL_SAMPLES = 2000
+# Conjunto de validação compartilhado (maior para reduzir ruído do bandit)
 x_val = x_test[:VAL_SAMPLES]
 y_val = y_test[:VAL_SAMPLES]
-####################
 
 # Fatias por usuário
 user_data = []
@@ -77,7 +69,7 @@ ap_users = {
 }
 
 # -------------------------
-# Modelo base
+# Modelo base (mesmo do baseline)
 # -------------------------
 def build_model():
     model = Sequential([
@@ -92,64 +84,30 @@ def build_model():
                   metrics=['accuracy'])
     return model
 
-#########################
-# APRENDIZADO POR REFORÇO
-######################
+# -------------------------
+# Bandit (EMA no valor do braço)
+# -------------------------
 class BanditSelector:
     """
-    UCB1 por AP: cada 'braço' é um UE do AP.
-    reward ~ acc no val set (0..1) do modelo local treinado daquele UE.
+    Mantém q[ap][uid] = EMA da recompensa (recompensa = métrica de utilidade do UE).
     """
-    def __init__(self, ap_to_users, c=1.5):
-        self.c = c
-        self.t = defaultdict(int)            # passos por AP
-        self.n = defaultdict(lambda: defaultdict(int))   # pulls[ap][uid]
-        self.q = defaultdict(lambda: defaultdict(float)) # mean reward[ap][uid]
+    def __init__(self, ap_to_users, ema_alpha=0.25):
+        self.ema_alpha = ema_alpha
+        self.n = defaultdict(lambda: defaultdict(int))
+        self.q = defaultdict(lambda: defaultdict(float))
         self.ap_to_users = ap_to_users
 
-    def select(self, ap, k):
-        users = self.ap_to_users[ap]
-        # Primeiro garante 1 pull para cada UE (fase de "warm-up")
-        cold = [u for u in users if self.n[ap][u] == 0]
-        if len(cold) >= k:
-            return cold[:k]
-
-        chosen = list(cold)  # pega os "virgens" primeiro
-        # UCB para o restante
-        self.t[ap] += 1
-        T = max(1, self.t[ap])
-        candidates = [u for u in users if self.n[ap][u] > 0]
-        if candidates:
-            scores = []
-            for u in candidates:
-                mean = self.q[ap][u]
-                bonus = self.c * math.sqrt(math.log(T) / self.n[ap][u])
-                scores.append((mean + bonus, u))
-            scores.sort(reverse=True)
-            for _, u in scores:
-                if len(chosen) < k:
-                    chosen.append(u)
-                else:
-                    break
-        # Se ainda faltar, completa (deve ser raro)
-        if len(chosen) < k:
-            rest = [u for u in users if u not in chosen]
-            chosen += rest[:(k - len(chosen))]
-        return chosen
+    def select_all(self, ap):
+        return self.ap_to_users[ap]  # usamos todos os UEs
 
     def update(self, ap, uid, reward):
-        # incremental mean
-        n_old = self.n[ap][uid]
+        self.n[ap][uid] += 1
         q_old = self.q[ap][uid]
-        n_new = n_old + 1
-        q_new = q_old + (reward - q_old) / n_new
-        self.n[ap][uid] = n_new
-        self.q[ap][uid] = q_new
-
-#####################################
+        a = self.ema_alpha
+        self.q[ap][uid] = (1 - a) * q_old + a * float(reward)
 
 # -------------------------
-# Agregações (FedAvg)
+# FedAvg (ponderado)
 # -------------------------
 def fedavg(weights_list, sizes):
     """ Soma ponderada por n_i / N, camada a camada. """
@@ -161,33 +119,35 @@ def fedavg(weights_list, sizes):
         new_weights.append(np.sum(coeffs * stack, axis=0))
     return new_weights
 
-
-# Instância global do bandit (um por script)
-bandit = BanditSelector(ap_users, c=1.5)
-
-def select_users_for_ap(ap, round_idx):
-    users = ap_users[ap]
-    if USE_ALL_USERS_PER_AP:
-        return users
-    k = min(K_PER_AP, len(users))
-    return bandit.select(ap, k)
-
+def user_weight_from_q(ap, uid, qdict, floor=WEIGHT_FLOOR, ceil=WEIGHT_CEIL, eps=1e-6):
+    qs = [qdict[ap][u] for u in ap_users[ap]]
+    q_min, q_max = min(qs), max(qs)
+    if q_max - q_min < eps:
+        return 1.0
+    q_norm = (qdict[ap][uid] - q_min) / (q_max - q_min)
+    return floor + (ceil - floor) * q_norm  # peso em [floor, ceil]
 
 # -------------------------
-# Loop Federado Hierárquico: Usuários -> AP -> Servidor
+# Loop Federado Hierárquico
 # -------------------------
+bandit = BanditSelector(ap_users, ema_alpha=0.25)
 global_model = build_model()
+
+# Pré-cria datasets para avaliação rápida
+val_ds = tf.data.Dataset.from_tensor_slices((x_val, y_val)).batch(BATCH_SIZE)
+test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(BATCH_SIZE)
 
 for r in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {r+1}")
     ap_models_weights = []
     ap_sizes = []
 
-    # 1) Cada AP coordena seus usuários e faz uma agregação local
     for ap in range(NUM_AP):
-        selected_user_ids = select_users_for_ap(ap, r)
+        selected_user_ids = bandit.select_all(ap)  # TODOS os UEs
+
         local_weights_list = []
         local_sizes = []
+        user_weights = []
 
         for uid in selected_user_ids:
             # cada usuário começa do modelo global
@@ -203,33 +163,36 @@ for r in range(EPOCHS_GLOBAL):
                 shuffle=False
             )
 
-            #############
-            # Recompensa = acc no val set (proxy de generalização)
-            _, acc_u = local_model.evaluate(x_val, y_val, verbose=0)
-            reward = float(acc_u)  # 0..1
-
-            #Atualiza o bandit do AP com a recompensa desse UE
+            # Recompensa: preferimos quem generaliza no val
+            # (penaliza leve overfit local)
+            _, acc_local = local_model.evaluate(x_u, y_u,   verbose=0)
+            _, acc_val   = local_model.evaluate(val_ds,     verbose=0)
+            reward = acc_val - LAMBDA_OVERFIT * max(0.0, acc_local - acc_val)
             bandit.update(ap, uid, reward)
-            #################
 
             local_weights_list.append(local_model.get_weights())
-            local_sizes.append(len(x_u))  # aqui: 100 por usuário
+            local_sizes.append(len(x_u))  # 100 por UE
 
-        # Agregação no AP (modelo do AP)
-        ap_weights = fedavg(local_weights_list, local_sizes)
+        # Converte q -> pesos no FedAvg do AP
+        for uid in selected_user_ids:
+            w_uid = user_weight_from_q(ap, uid, bandit.q)
+            user_weights.append(w_uid)
+
+        local_sizes_weighted = [n * w for n, w in zip(local_sizes, user_weights)]
+        ap_weights = fedavg(local_weights_list, local_sizes_weighted)
         ap_models_weights.append(ap_weights)
-        ap_sizes.append(np.sum(local_sizes))  # total de amostras desse AP
+        ap_sizes.append(np.sum(local_sizes_weighted))
 
-    # 2) Servidor agrega os modelos dos APs (FedAvg global)
+    # Agregação global
     new_global_weights = fedavg(ap_models_weights, ap_sizes)
     global_model.set_weights(new_global_weights)
 
-    # (Opcional) Acompanhar evolução
-    loss_r, acc_r = global_model.evaluate(x_test, y_test, verbose=0)
+    # Acompanhar evolução
+    loss_r, acc_r = global_model.evaluate(test_ds, verbose=0)
     print(f"   ↳ após agregação dos APs: acc={acc_r*100:.2f}%")
 
 # -------------------------
 # Avaliação final
 # -------------------------
-loss, acc = global_model.evaluate(x_test, y_test, verbose=2)
+loss, acc = global_model.evaluate(test_ds, verbose=2)
 print(f"\n🎯 Acurácia final do modelo global: {acc * 100:.2f}%")
