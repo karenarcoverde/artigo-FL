@@ -1,11 +1,10 @@
-import os, random
+import os, random, math
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.datasets import cifar10
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from sklearn.model_selection import train_test_split
-import math
 from collections import defaultdict
 
 # -------------------------
@@ -14,9 +13,7 @@ from collections import defaultdict
 SEED = 42
 os.environ["PYTHONHASHSEED"] = "0"
 os.environ["TF_DETERMINISTIC_OPS"] = "1"
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
+random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 try:
     tf.config.experimental.enable_op_determinism(True)
 except Exception:
@@ -28,8 +25,11 @@ except Exception:
 NUM_AP = 4
 USERS_PER_AP = 10
 TOTAL_USERS = NUM_AP * USERS_PER_AP
-EPOCHS_LOCAL = 5
-EPOCHS_GLOBAL = 30
+
+# AUMENTE AQUI:
+SAMPLES_PER_USER = 300        # antes era 100. Tente 300 ou 500.
+EPOCHS_LOCAL = 5              # com 300 amostras/UE, pode testar 7–10
+EPOCHS_GLOBAL = 30            # pode testar 40 para dar espaço ao ganho
 BATCH_SIZE = 64
 
 # Bandit-weighted FedAvg (estável)
@@ -43,29 +43,36 @@ ALPHA_LEVEL = 0.7             # peso do nível (acc_val)
 BETA_GAIN  = 0.3              # peso do ganho marginal
 
 # -------------------------
-# Dados
+# Dados (IID com mais amostras por UE)
 # -------------------------
 (x_train, y_train), (x_test, y_test) = cifar10.load_data()
 x_train = x_train.astype("float32")/255.0
 x_test  = x_test.astype("float32")/255.0
 
-x_train, _, y_train, _ = train_test_split(
+# Amostra um pool estratificado com TOTAL_USERS * SAMPLES_PER_USER
+TOTAL_TRAIN = TOTAL_USERS * SAMPLES_PER_USER
+x_pool, _, y_pool, _ = train_test_split(
     x_train, y_train,
-    train_size=TOTAL_USERS * 100,  # 100 amostras por usuário
+    train_size=TOTAL_TRAIN,
     stratify=y_train,
     random_state=SEED,
     shuffle=True
 )
 
+# Embaralha e fatia igualmente (IID) em blocos de SAMPLES_PER_USER
+rng = np.random.default_rng(SEED)
+perm = rng.permutation(TOTAL_TRAIN)
+x_pool = x_pool[perm]; y_pool = y_pool[perm]
+
+user_data = []
+for u in range(TOTAL_USERS):
+    s = u * SAMPLES_PER_USER
+    e = (u + 1) * SAMPLES_PER_USER
+    user_data.append((x_pool[s:e], y_pool[s:e]))
+
 # Val set compartilhado (maior)
 x_val = x_test[:VAL_SAMPLES]
 y_val = y_test[:VAL_SAMPLES]
-
-# Fatias por usuário
-user_data = []
-for i in range(TOTAL_USERS):
-    s, e = i*100, (i+1)*100
-    user_data.append((x_train[s:e], y_train[s:e]))
 
 # Índices de usuários por AP
 ap_users = {
@@ -176,7 +183,7 @@ for r in range(EPOCHS_GLOBAL):
                 epochs=EPOCHS_LOCAL,
                 batch_size=BATCH_SIZE,
                 verbose=0,
-                shuffle=True   # <- ajuda com 100 exemplos/UE
+                shuffle=True   # com mais dados, mantém bom ruído de mini-batch
             )
 
             # Recompensa blend: nível + ganho marginal - penalização de overfit
@@ -190,7 +197,7 @@ for r in range(EPOCHS_GLOBAL):
             bandit.update(ap, uid, reward)
 
             local_weights_list.append(local_model.get_weights())
-            local_sizes.append(len(x_u))  # 100
+            local_sizes.append(len(x_u))  # agora = SAMPLES_PER_USER (ex.: 300)
 
         # Converte q -> pesos SUAVES (média≈1)
         mults = weights_from_q_softmax(ap, bandit.q)
@@ -201,7 +208,7 @@ for r in range(EPOCHS_GLOBAL):
         ap_models_weights.append(ap_weights)
         ap_sizes.append(np.sum(local_sizes_weighted))
 
-    # Agregação global (FedAvg puro — sem momentum, mais estável)
+    # Agregação global (FedAvg puro — estável)
     new_global_weights = fedavg(ap_models_weights, ap_sizes)
     global_model.set_weights(new_global_weights)
 
