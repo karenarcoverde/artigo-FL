@@ -25,20 +25,144 @@ NUM_AP = 4
 USERS_PER_AP = 10
 TOTAL_USERS = NUM_AP * USERS_PER_AP
 
-SAMPLES_PER_USER = 300
-EPOCHS_LOCAL = 5
-EPOCHS_GLOBAL = 30
+SAMPLES_PER_USER = 300        # antes era 100
+EPOCHS_LOCAL = 5              # com 300 amostras/UE, pode testar 7–10
+EPOCHS_GLOBAL = 30            # pode testar 40
 BATCH_SIZE = 64
 
 # Seleção de UEs (sem RL)
 USE_ALL_USERS_PER_AP = True   # se False, usa K_PER_AP aleatórios por AP
 K_PER_AP = 6
 
-VAL_SAMPLES = 5000            # apenas monitoramento
+VAL_SAMPLES = 5000            # só para acompanhar global (não influencia seleção)
 
-# Particionamento
-USE_DIRICHLET = True          # <<< LIGA/DESLIGA non-IID
-ALPHA_DIR = 0.5               # menor => mais não-IID (ex.: 0.3 / 0.1)
+# Grau de não-IID (Dirichlet)
+ALPHA_DIRICHLET = 0.3         # ↓ => mais não-IID, ↑ => mais IID (ex.: 1.0)
+
+# -------------------------
+# Dados (NÃO-IID com Dirichlet)
+# -------------------------
+(x_train, y_train), (x_test, y_test) = cifar10.load_data()
+x_train = x_train.astype("float32")/255.0
+x_test  = x_test.astype("float32")/255.0
+
+# (opcional) limitar o pool para bater com TOTAL_USERS * SAMPLES_PER_USER
+TOTAL_TRAIN = TOTAL_USERS * SAMPLES_PER_USER
+x_pool, _, y_pool, _ = train_test_split(
+    x_train, y_train,
+    train_size=TOTAL_TRAIN,
+    stratify=y_train,
+    random_state=SEED,
+    shuffle=True
+)
+
+def build_dirichlet_non_iid_splits(x, y, total_users, samples_per_user, alpha=0.3, seed=SEED):
+    """
+    Distribui (x,y) em 'total_users' usuários com viés de classe por Dirichlet.
+    Respeita capacidade = samples_per_user por usuário.
+    """
+    rng = np.random.default_rng(seed)
+    y_flat = y.reshape(-1)                    # (N,)
+    num_classes = int(np.max(y_flat) + 1)
+    N = len(y_flat)
+    cap = np.array([samples_per_user]*total_users, dtype=int)
+
+    # índices por classe
+    class_to_idx = {c: np.where(y_flat == c)[0] for c in range(num_classes)}
+    for c in range(num_classes):
+        rng.shuffle(class_to_idx[c])
+
+    # listas por usuário
+    user_indices = [list() for _ in range(total_users)]
+    leftover = []
+
+    for c in range(num_classes):
+        idxs = class_to_idx[c]
+        n_c = len(idxs)
+        if n_c == 0:
+            continue
+
+        # amostra proporções por usuário
+        p = rng.dirichlet(alpha * np.ones(total_users, dtype=np.float32))
+        alloc = np.floor(p * n_c).astype(int)
+
+        # distribuir sobras por maiores frações
+        remainder = n_c - np.sum(alloc)
+        if remainder > 0:
+            frac_order = np.argsort(-(p - alloc / max(1, n_c)))
+            for u in frac_order[:remainder]:
+                alloc[u] += 1
+
+        # alocar respeitando capacidade
+        start = 0
+        order_users = list(range(total_users))
+        rng.shuffle(order_users)
+        for u in order_users:
+            k = int(alloc[u])
+            if k <= 0:
+                continue
+            take = min(k, cap[u])
+            if take > 0:
+                user_indices[u].extend(idxs[start:start+take])
+                start += take
+                cap[u] -= take
+            rem = k - take
+            if rem > 0:
+                leftover.extend(idxs[start:start+rem])
+                start += rem
+
+        if start < n_c:
+            leftover.extend(idxs[start:])
+
+    # preencher quem ficou faltando com leftovers
+    rng.shuffle(leftover)
+    li = 0
+    for u in range(total_users):
+        need = cap[u]
+        if need <= 0:
+            continue
+        got = min(need, len(leftover) - li)
+        if got > 0:
+            user_indices[u].extend(leftover[li:li+got])
+            li += got
+            cap[u] -= got
+
+    # truncar/preencher para exatamente samples_per_user por usuário
+    for u in range(total_users):
+        arr = np.array(user_indices[u], dtype=np.int64)
+        rng.shuffle(arr)
+        if len(arr) < samples_per_user:
+            need = samples_per_user - len(arr)
+            # fallback: amostrar com reposição do próprio x
+            extra = rng.choice(len(x), size=need, replace=True)
+            arr = np.concatenate([arr, extra])
+        elif len(arr) > samples_per_user:
+            arr = arr[:samples_per_user]
+        user_indices[u] = arr
+
+    # montar tuplas (x_u, y_u)
+    user_data = []
+    for u in range(total_users):
+        idxs = user_indices[u]
+        x_u = x[idxs]
+        y_u = y[idxs]                      # mantém shape (n,1) para sparse_categorical
+        user_data.append((x_u, y_u))
+    return user_data
+
+# Constrói splits não-IID no pool
+user_data = build_dirichlet_non_iid_splits(
+    x_pool, y_pool,
+    total_users=TOTAL_USERS,
+    samples_per_user=SAMPLES_PER_USER,
+    alpha=ALPHA_DIRICHLET,
+    seed=SEED
+)
+
+x_val = x_test[:VAL_SAMPLES]
+y_val = y_test[:VAL_SAMPLES]
+
+# Índices de usuários por AP
+ap_users = { ap: list(range(ap*USERS_PER_AP, (ap+1)*USERS_PER_AP)) for ap in range(NUM_AP) }
 
 # -------------------------
 # Modelo base (igual ao baseline)
@@ -69,125 +193,19 @@ def fedavg(weights_list, sizes):
     return new_weights
 
 # -------------------------
-# Particionamento non-IID por Dirichlet
-# -------------------------
-def dirichlet_partition(x, y, num_users, samples_per_user, alpha, seed=SEED, num_classes=10):
-    """
-    Retorna [(x_u, y_u)] para u=0..num_users-1.
-    Cada usuário u recebe uma mistura de classes p_u ~ Dir(alpha),
-    e uma contagem Multinomial(samples_per_user, p_u).
-    """
-    rng = np.random.default_rng(seed)
-
-    # índices por classe
-    class_indices = {c: np.where(y.flatten() == c)[0] for c in range(num_classes)}
-    for c in range(num_classes):
-        rng.shuffle(class_indices[c])
-
-    # mistura por usuário ~ Dirichlet
-    P = rng.dirichlet(alpha * np.ones(num_classes), size=num_users)
-
-    # contagens Multinomial(S, p_u)
-    counts = np.zeros((num_users, num_classes), dtype=int)
-    for u in range(num_users):
-        counts[u] = rng.multinomial(samples_per_user, P[u])
-
-    # garantir que não exceda disponibilidade por classe (ajuste proporcional)
-    for c in range(num_classes):
-        need = int(counts[:, c].sum())
-        have = int(len(class_indices[c]))
-        if need <= have:
-            continue
-        # escala para caber
-        scale = have / max(1, need)
-        scaled = np.floor(counts[:, c] * scale).astype(int)
-        rest = have - int(scaled.sum())
-        # distribui as sobras segundo os maiores resíduos
-        residuals = (counts[:, c] * scale) - scaled
-        order = np.argsort(-residuals)
-        for i in range(rest):
-            scaled[order[i]] += 1
-        counts[:, c] = scaled
-
-    # monta os índices por usuário
-    user_indices = [[] for _ in range(num_users)]
-    ptr = {c: 0 for c in range(num_classes)}
-    for u in range(num_users):
-        for c in range(num_classes):
-            k = int(counts[u, c])
-            if k <= 0:
-                continue
-            start = ptr[c]; end = start + k
-            idxs = class_indices[c][start:end]
-            user_indices[u].extend(idxs.tolist())
-            ptr[c] = end
-        rng.shuffle(user_indices[u])
-
-    # datasets por usuário (pode ficar com < samples_per_user se faltou alguma classe)
-    user_data = []
-    for u in range(num_users):
-        idxs = np.array(user_indices[u], dtype=int)
-        user_data.append((x[idxs], y[idxs]))
-    return user_data
-
-# -------------------------
-# Dados
-# -------------------------
-(x_train, y_train), (x_test, y_test) = cifar10.load_data()
-x_train = x_train.astype("float32")/255.0
-x_test  = x_test.astype("float32")/255.0
-num_classes = 10
-
-if USE_DIRICHLET:
-    # Non-IID forte/leve conforme ALPHA_DIR
-    user_data = dirichlet_partition(
-        x_train, y_train,
-        num_users=TOTAL_USERS,
-        samples_per_user=SAMPLES_PER_USER,
-        alpha=ALPHA_DIR,
-        seed=SEED,
-        num_classes=num_classes
-    )
-else:
-    # IID com estratificação e fatiamento igual
-    TOTAL_TRAIN = TOTAL_USERS * SAMPLES_PER_USER
-    x_pool, _, y_pool, _ = train_test_split(
-        x_train, y_train,
-        train_size=TOTAL_TRAIN,
-        stratify=y_train,
-        random_state=SEED,
-        shuffle=True
-    )
-    rng = np.random.default_rng(SEED)
-    perm = rng.permutation(TOTAL_TRAIN)
-    x_pool = x_pool[perm]; y_pool = y_pool[perm]
-    user_data = []
-    for u in range(TOTAL_USERS):
-        s = u * SAMPLES_PER_USER
-        e = (u + 1) * SAMPLES_PER_USER
-        user_data.append((x_pool[s:e], y_pool[s:e]))
-
-# Val set (apenas monitoramento)
-VAL_SAMPLES = min(VAL_SAMPLES, len(x_test))
-x_val = x_test[:VAL_SAMPLES]; y_val = y_test[:VAL_SAMPLES]
-
-# Índices de usuários por AP
-ap_users = { ap: list(range(ap*USERS_PER_AP, (ap+1)*USERS_PER_AP)) for ap in range(NUM_AP) }
-
-# -------------------------
 # Seleção de usuários (sem RL)
 # -------------------------
-rng = np.random.default_rng(SEED)
 def select_users_for_ap(ap, round_idx):
     users = ap_users[ap]
     if USE_ALL_USERS_PER_AP or K_PER_AP >= len(users):
         return users
-    return list(rng.choice(users, size=K_PER_AP, replace=False))
+    return list(np.random.default_rng(SEED + round_idx + ap).choice(users, size=K_PER_AP, replace=False))
 
 # -------------------------
 # Loop Federado Hierárquico
 # -------------------------
 global_model = build_model()
+
 val_ds  = tf.data.Dataset.from_tensor_slices((x_val,  y_val)).batch(BATCH_SIZE)
 test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(BATCH_SIZE)
 
@@ -220,7 +238,7 @@ for r in range(EPOCHS_GLOBAL):
             )
 
             local_weights_list.append(local_model.get_weights())
-            local_sizes.append(len(x_u))  # pode variar levemente no Dirichlet
+            local_sizes.append(len(x_u))  # SAMPLES_PER_USER (ex.: 300)
 
         # Agregação no AP (FedAvg padrão por tamanho)
         ap_weights = fedavg(local_weights_list, local_sizes)
