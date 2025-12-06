@@ -22,8 +22,8 @@ except Exception:
 # -------------------------
 # Configurações
 # -------------------------
-NUM_AP = 4
-USERS_PER_AP = 10
+NUM_AP = 5
+USERS_PER_AP = 20
 TOTAL_USERS = NUM_AP * USERS_PER_AP
 
 # Treino local
@@ -38,8 +38,8 @@ VAL_SAMPLES = 5000
 # -------------------------
 # Seleção SEM reforço
 # -------------------------
-USE_ALL_USERS_PER_AP = True    # ← usa todos os UEs por AP em todas as rodadas
-K_PER_AP = 4                   # (não usado quando USE_ALL_USERS_PER_AP=True)
+USE_ALL_USERS_PER_AP = False    # ← usa todos os UEs por AP em todas as rodadas
+K_PER_AP = 2                   # (não usado quando USE_ALL_USERS_PER_AP=True)
 
 # Justiça/rotatividade básica (sem Q) — mantém para compatibilidade
 EPS = 0.05
@@ -98,6 +98,12 @@ def build_model():
                   loss='sparse_categorical_crossentropy',
                   metrics=['accuracy'])
     return model
+
+def select_topk_random(ap, K):
+    """Seleciona K UEs aleatórios daquele AP (sem justiça, sem Q, sem nada)."""
+    users = ap_users[ap]
+    K = min(K, len(users))
+    return list(np.random.choice(users, size=K, replace=False))
 
 # -------------------------
 # Seleção (sem RL) com justiça simples por recência (compatível com "usar todos")
@@ -181,8 +187,18 @@ def pretty_num(x):
     for u in ["", "k", "M", "G", "T", "P"]:
         if abs(x) < 1000: return f"{x:.2f}{u}"
         x /= 1000.0
-        # continua reduzindo
     return f"{x:.2f}E"
+
+# -------------------------
+# Índice de Jain (fairness de participação)
+# -------------------------
+def jain_index(x):
+    x = np.array(x, dtype=np.float64)
+    if np.all(x == 0):
+        return 1.0
+    num = (np.sum(x))**2
+    den = len(x) * np.sum(x**2)
+    return float(num / den)
 
 # -------------------------
 # Loop Federado Hierárquico (SEM RL, usando TODOS os UEs)
@@ -224,14 +240,11 @@ for r in range(EPOCHS_GLOBAL):
 
     for ap in range(NUM_AP):
         if USE_ALL_USERS_PER_AP:
-            selected_user_ids = selector.select_all(ap)   # ← todos os 10 por AP
+            selected_user_ids = selector.select_all(ap)   # todos os 10 por AP
         else:
-            selected_user_ids = selector.select_topk_fair(ap, K_PER_AP, round_idx=r,
-                                                         eps=EPS, fair_fraction=FAIR_FRACTION)
+            # top-K TOTALMENTE ALEATÓRIO em todas as rodadas
+            selected_user_ids = select_topk_random(ap, K_PER_AP)
         selected_this_round += len(selected_user_ids)
-
-        # print opcional para checagem:
-        # print(f"AP {ap}: {len(selected_user_ids)} UEs -> {selected_user_ids}")
 
         local_weights_list = []
         local_sizes = []
@@ -294,4 +307,30 @@ print(f"FLOPs/amostra (treino):         {pretty_num(train_flops_per_sample)}FLOP
 print(f"Total de atualizações (UEs):     {total_selected_updates} (somatório de UEs selecionados em todas as rodadas)")
 print(f"FLOPs totais (treino local):    {pretty_num(total_flops_all_rounds)}FLOPs")
 print(f"Bytes totais (↓↑, float32):     {total_bytes_all_rounds/1e6:.2f} MB")
+
+# ----- FAIRNESS: Índice de Jain das participações -----
+participations = []
+for ap in range(NUM_AP):
+    for uid in ap_users[ap]:
+        participations.append(selector.n[ap][uid])
+
+jain_particip = jain_index(participations)
+print(f"Índice de Jain das participações (sem reforço): {jain_particip:.4f}")
 print(  "=========================================================\n")
+
+# CIFAR-10 labels
+class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+               'dog', 'frog', 'horse', 'ship', 'truck']
+
+# Pega um subconjunto do teste
+x_sample = x_test[:20]
+y_sample = y_test[:20].flatten()
+
+probs = global_model.predict(x_sample, verbose=0)
+y_pred = np.argmax(probs, axis=1)
+
+print("\nAlgumas previsões (verdadeiro -> predito):")
+for i in range(20):
+    true_label = class_names[y_sample[i]]
+    pred_label = class_names[y_pred[i]]
+    print(f"{i:02d} | {y_sample[i]} ({true_label}) -> {y_pred[i]} ({pred_label})")

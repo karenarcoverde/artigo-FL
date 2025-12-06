@@ -8,6 +8,27 @@ from sklearn.model_selection import train_test_split
 from collections import defaultdict
 
 # -------------------------
+# Índice de Jain (fairness)
+# -------------------------
+def jain_index(x):
+    """
+    Índice de Jain:
+        J(x) = ( (sum_i x_i)^2 ) / ( n * sum_i x_i^2 )
+    x: array-like com valores não-negativos (ex.: nº de participações por UE)
+    Retorna valor em [0, 1]; quanto mais perto de 1, mais justo.
+    """
+    x = np.array(x, dtype=float)
+    n = len(x)
+    if n == 0:
+        return 0.0
+    s = x.sum()
+    s2 = np.sum(x**2)
+    if s2 == 0:
+        return 0.0
+    return (s**2) / (n * s2)
+
+
+# -------------------------
 # Sementes / determinismo
 # -------------------------
 SEED = 42
@@ -22,8 +43,8 @@ except Exception:
 # -------------------------
 # Configurações
 # -------------------------
-NUM_AP = 4
-USERS_PER_AP = 10
+NUM_AP = 5
+USERS_PER_AP = 20
 TOTAL_USERS = NUM_AP * USERS_PER_AP
 
 # Treino local
@@ -46,7 +67,7 @@ BETA_GAIN  = 0.3              # peso do ganho marginal
 # Seleção COM reforço (top-K + justiça)
 # -------------------------
 USE_ALL_USERS_PER_AP = False  # << agora selecionamos menos UEs por AP
-K_PER_AP = 4                  # ex.: de 10 -> 4 por AP
+K_PER_AP = 2                  # ex.: de 10 -> 4 por AP
 
 # Exploração/justiça
 EPS = 0.05                    # ε-greedy (exploração)
@@ -379,7 +400,25 @@ print("\n==================== RELATÓRIO FINAL ====================")
 print(f"Parâmetros do modelo:           {n_params:,}")
 print(f"FLOPs/amostra (forward):        {pretty_num(infer_flops)}FLOPs")
 print(f"FLOPs/amostra (treino):         {pretty_num(train_flops_per_sample)}FLOPs (≈2.5×)")
-print(f"Total de atualizações (UEs):     {total_selected_updates} (somatório de UEs selecionados em todas as rodadas)")
+print(f"Total de atualizações (UEs):    {total_selected_updates} (somatório de UEs selecionados em todas as rodadas)")
 print(f"FLOPs totais (treino local):    {pretty_num(total_flops_all_rounds)}FLOPs")
 print(f"Bytes totais (↓↑, float32):     {total_bytes_all_rounds/1e6:.2f} MB")
-print(  "=========================================================\n")
+print("=========================================================\n")
+
+# -------------------------
+# FAIRNESS: ÍNDICE DE JAIN DAS PARTICIPAÇÕES
+# -------------------------
+participations = []
+for ap in range(NUM_AP):
+    for uid in ap_users[ap]:
+        participations.append(bandit.n[ap][uid])
+
+participations = np.array(participations, dtype=float)
+jain_part = jain_index(participations)
+
+print("\n==================== FAIRNESS DE PARTICIPAÇÃO ====================")
+print(f"Número total de UEs:                  {len(participations)}")
+print(f"Participações mín / máx:              {participations.min():.0f} / {participations.max():.0f}")
+print(f"Média / desvio padrão das particip.:  {participations.mean():.2f} / {participations.std():.2f}")
+print(f"Índice de Jain das participações:     {jain_part:.4f}")
+print("==============================================================\n")
