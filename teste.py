@@ -66,7 +66,7 @@ BETA_GAIN  = 0.3              # peso do ganho marginal
 # -------------------------
 # Seleção COM reforço (top-K + justiça)
 # -------------------------
-USE_ALL_USERS_PER_AP = False  # << agora selecionamos menos UEs por AP
+USE_ALL_USERS_PER_AP = True  # << agora selecionamos menos UEs por AP
 K_PER_AP = 2                  # ex.: de 10 -> 4 por AP
 
 # Exploração/justiça

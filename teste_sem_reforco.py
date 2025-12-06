@@ -38,7 +38,7 @@ VAL_SAMPLES = 5000
 # -------------------------
 # Seleção SEM reforço
 # -------------------------
-USE_ALL_USERS_PER_AP = False    # ← usa todos os UEs por AP em todas as rodadas
+USE_ALL_USERS_PER_AP = True    # ← usa todos os UEs por AP em todas as rodadas
 K_PER_AP = 2                   # (não usado quando USE_ALL_USERS_PER_AP=True)
 
 # Justiça/rotatividade básica (sem Q) — mantém para compatibilidade
