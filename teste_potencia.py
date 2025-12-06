@@ -1,7 +1,11 @@
 import numpy as np
 import math
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+
+# Se quiser ver os logs de treino por rodada, mude para True
+VERBOSE_TRAIN = False
 
 # -----------------------------------------
 # Ações do agente: frações de potência
@@ -57,11 +61,16 @@ class RLBanditAgent:
       tende a dar maior recompensa média.
     - Atualização por média incremental.
     """
-    def __init__(self, n_actions: int = 3, epsilon: float = 0.1):
+    def __init__(self,
+                 n_actions: int = 3,
+                 epsilon: float = 0.1,
+                 rng: Optional[np.random.Generator] = None):
         self.n_actions = n_actions
         self.epsilon = epsilon
         self.Q = np.zeros(n_actions, dtype=float)  # estimativa de valor por ação
         self.N = np.zeros(n_actions, dtype=float)  # contagem de vezes que cada ação foi escolhida
+        # RNG próprio do agente
+        self.rng = rng if rng is not None else np.random.default_rng()
 
     def act(self) -> int:
         """
@@ -69,8 +78,8 @@ class RLBanditAgent:
         Retorna o índice da ação.
         """
         # Exploração
-        if np.random.rand() < self.epsilon:
-            return int(np.random.randint(self.n_actions))
+        if self.rng.random() < self.epsilon:
+            return int(self.rng.integers(self.n_actions))
         # Exploitation (greedy)
         return int(np.argmax(self.Q))
 
@@ -152,8 +161,7 @@ class CentralServer:
         """
         Agregação tipo FedAvg "clássico":
         - Aqui NÃO usamos reward como peso.
-        - Todos os APs têm o mesmo peso (cenário onde FedAvg
-          não consegue explorar qualidade heterogênea dos APs).
+        - Todos os APs têm o mesmo peso.
         """
         if weights is None:
             weights = {ap_id: 1.0 for ap_id in ap_models.keys()}
@@ -287,31 +295,36 @@ def train_frl(ap_pos: np.ndarray,
               steps_per_round: int,
               p_max: float,
               noise_power: float,
-              epsilon: float,
+              ap_eps: np.ndarray,
               seed_train: int) -> List[AccessPoint]:
     """
     Treina APs como agentes RL (bandits) com agregação federada (FRL-FedAvg).
 
     - num_rounds: número de rodadas federadas
     - steps_per_round: número de slots por rodada
+    - ap_eps: vetor com epsilon de cada AP (heterogêneo!)
 
     Retorna:
         lista de APs treinados (com seus agentes)
     """
     M, K = large_scale.shape
 
-    # cria APs, cada um com seu agente bandit
-    aps = [
-        AccessPoint(
-            ap_id=m,
-            position=ap_pos[m],
-            rl_agent=RLBanditAgent(
-                n_actions=len(ACTION_LEVELS),
-                epsilon=epsilon
+    # cria APs, cada um com seu agente bandit, epsilon e RNG próprios
+    aps: List[AccessPoint] = []
+    for m in range(M):
+        rng_agent = np.random.default_rng(seed_train + 1000 + m)
+        agent = RLBanditAgent(
+            n_actions=len(ACTION_LEVELS),
+            epsilon=float(ap_eps[m]),
+            rng=rng_agent
+        )
+        aps.append(
+            AccessPoint(
+                ap_id=m,
+                position=ap_pos[m],
+                rl_agent=agent
             )
         )
-        for m in range(M)
-    ]
 
     server = CentralServer()  # aqui usamos aggregate (FedAvg simples)
     rng = np.random.default_rng(seed_train)
@@ -374,8 +387,9 @@ def train_frl(ap_pos: np.ndarray,
         server.aggregate(ap_models)  # pesos uniformes
         server.broadcast(aps)
 
-        media_reward = np.mean(list(rewards_accum.values())) / steps_per_round
-        print(f"[FRL-FedAvg] Round {rnd+1}/{num_rounds} - reward médio por slot: {media_reward:.4f}")
+        if VERBOSE_TRAIN:
+            media_reward = np.mean(list(rewards_accum.values())) / steps_per_round
+            print(f"[FRL-FedAvg] Round {rnd+1}/{num_rounds} - reward médio por slot: {media_reward:.4f}")
 
     return aps
 
@@ -391,7 +405,7 @@ def train_frl_qgradual(ap_pos: np.ndarray,
                        steps_per_round: int,
                        p_max: float,
                        noise_power: float,
-                       epsilon: float,
+                       ap_eps: np.ndarray,
                        seed_train: int,
                        alpha_q: float = 0.3) -> List[AccessPoint]:
     """
@@ -401,17 +415,21 @@ def train_frl_qgradual(ap_pos: np.ndarray,
     """
     M, K = large_scale.shape
 
-    aps = [
-        AccessPoint(
-            ap_id=m,
-            position=ap_pos[m],
-            rl_agent=RLBanditAgent(
-                n_actions=len(ACTION_LEVELS),
-                epsilon=epsilon
+    aps: List[AccessPoint] = []
+    for m in range(M):
+        rng_agent = np.random.default_rng(seed_train + 2000 + m)
+        agent = RLBanditAgent(
+            n_actions=len(ACTION_LEVELS),
+            epsilon=float(ap_eps[m]),
+            rng=rng_agent
+        )
+        aps.append(
+            AccessPoint(
+                ap_id=m,
+                position=ap_pos[m],
+                rl_agent=agent
             )
         )
-        for m in range(M)
-    ]
 
     server = CentralServer(alpha_q=alpha_q)
     rng = np.random.default_rng(seed_train)
@@ -469,8 +487,9 @@ def train_frl_qgradual(ap_pos: np.ndarray,
         server.aggregate_qgradual(ap_models, rewards_accum)
         server.broadcast(aps)
 
-        media_reward = np.mean(list(rewards_accum.values())) / steps_per_round
-        print(f"[FRL-QGradual] Round {rnd+1}/{num_rounds} - reward médio por slot: {media_reward:.4f}")
+        if VERBOSE_TRAIN:
+            media_reward = np.mean(list(rewards_accum.values())) / steps_per_round
+            print(f"[FRL-QGradual] Round {rnd+1}/{num_rounds} - reward médio por slot: {media_reward:.4f}")
 
     return aps
 
@@ -526,7 +545,7 @@ def evaluate_frl(aps: List[AccessPoint],
 
 
 # =========================================
-# 7. Main: rodar tudo e comparar
+# 7. Main: rodar múltiplas AVALIAÇÕES e comparar
 # =========================================
 
 if __name__ == "__main__":
@@ -537,47 +556,31 @@ if __name__ == "__main__":
     p_max = 1.0      # W
     noise_power = 1e-9
 
-    # Topologia fixa (mesmas posições para baseline e FRL)
-    seed_topology = 123
-    rng_top = np.random.default_rng(seed_topology)
+    # Heterogeneidade no CANAL
+    ap_quality = np.array([0.05, 0.2, 1.0, 4.0], dtype=float)
+
+    # Heterogeneidade no APRENDIZADO (ε)
+    ap_eps = np.array([0.9, 0.8, 0.3, 0.05], dtype=float)
+
+    # Parâmetros de simulação
+    T_eval = 5000            # maior para reduzir variância por avaliação
+    baseline_fraction = 0.3  # fração fixa de Pmax em todos os APs
+    num_rounds = 30
+    steps_per_round = 100
+
+    # Número de AVALIAÇÕES independentes (canal/UE diferentes)
+    N_EVAL = 30
+
+    # ---------- Topologia fixa ----------
+    rng_top = np.random.default_rng(42)  # seed fixa só para topologia
     ap_pos = rng_top.uniform(0.0, area_size, size=(M, 2))
     ue_pos = rng_top.uniform(0.0, area_size, size=(K, 2))
     large_scale = compute_large_scale(ap_pos, ue_pos, alpha=3.7)
-
-    # -------------------------------------------
-    # Torna o cenário BEM HETEROGÊNEO entre os APs
-    # AP 0: péssimo (0.05x)
-    # AP 1: ruim   (0.2x)
-    # AP 2: normal (1.0x)
-    # AP 3: ótimo  (4.0x)
-    # -------------------------------------------
-    ap_quality = np.array([0.05, 0.2, 1.0, 4.0], dtype=float)  # shape (M,)
     large_scale = large_scale * ap_quality[:, None]
-    print("Fatores de qualidade dos APs:", ap_quality)
 
-    # -----------------------
-    # Cenário simples (baseline)
-    # -----------------------
-    T_eval = 2000
-    baseline_fraction = 0.3  # fração fixa de Pmax em todos os APs
-
-    rates_simple = simulate_baseline(
-        ap_pos=ap_pos,
-        ue_pos=ue_pos,
-        large_scale=large_scale,
-        T_eval=T_eval,
-        p_max=p_max,
-        baseline_fraction=baseline_fraction,
-        noise_power=noise_power,
-        seed=999
-    )
-
-    # -----------------------
-    # Cenário robusto 1: FRL-FedAvg (pesos iguais)
-    # -----------------------
-    num_rounds = 30
-    steps_per_round = 100
-    epsilon = 0.2
+    # ---------- TREINO ÚNICO dos modelos ----------
+    seed_train_fedavg = 20000
+    seed_train_qgrad  = 30000
 
     aps_fedavg = train_frl(
         ap_pos=ap_pos,
@@ -587,24 +590,10 @@ if __name__ == "__main__":
         steps_per_round=steps_per_round,
         p_max=p_max,
         noise_power=noise_power,
-        epsilon=epsilon,
-        seed_train=2025
+        ap_eps=ap_eps,
+        seed_train=seed_train_fedavg
     )
 
-    rates_fedavg = evaluate_frl(
-        aps=aps_fedavg,
-        ap_pos=ap_pos,
-        ue_pos=ue_pos,
-        large_scale=large_scale,
-        T_eval=T_eval,
-        p_max=p_max,
-        noise_power=noise_power,
-        seed_eval=1001
-    )
-
-    # -----------------------
-    # Cenário robusto 2: FRL-QGradual
-    # -----------------------
     aps_qgradual = train_frl_qgradual(
         ap_pos=ap_pos,
         ue_pos=ue_pos,
@@ -613,36 +602,76 @@ if __name__ == "__main__":
         steps_per_round=steps_per_round,
         p_max=p_max,
         noise_power=noise_power,
-        epsilon=epsilon,
-        seed_train=3030,
+        ap_eps=ap_eps,
+        seed_train=seed_train_qgrad,
         alpha_q=0.3
     )
 
-    rates_qgradual = evaluate_frl(
-        aps=aps_qgradual,
-        ap_pos=ap_pos,
-        ue_pos=ue_pos,
-        large_scale=large_scale,
-        T_eval=T_eval,
-        p_max=p_max,
-        noise_power=noise_power,
-        seed_eval=2002
-    )
+    ganhos_fedavg_list = []
+    ganhos_qgradual_list = []
+    ganhos_qgradual_fedavg_list = []
 
-    # -----------------------
-    # Comparação final
-    # -----------------------
-    ganho_fedavg, R_simple, R_fedavg = ganho_percentual_taxa(rates_simple, rates_fedavg)
-    ganho_qgradual_base, _, R_qgradual = ganho_percentual_taxa(rates_simple, rates_qgradual)
-    ganho_qgradual_fedavg = (R_qgradual - R_fedavg) / (R_fedavg + 1e-12) * 100.0
+    # ---------- VÁRIAS AVALIAÇÕES (canal/UE aleatórios) ----------
+    for exp in range(N_EVAL):
+        seed_eval = 10000 + exp  # muda só o canal/UE
 
+        # Baseline
+        rates_simple = simulate_baseline(
+            ap_pos=ap_pos,
+            ue_pos=ue_pos,
+            large_scale=large_scale,
+            T_eval=T_eval,
+            p_max=p_max,
+            baseline_fraction=baseline_fraction,
+            noise_power=noise_power,
+            seed=seed_eval
+        )
+
+        # FedAvg
+        rates_fedavg = evaluate_frl(
+            aps=aps_fedavg,
+            ap_pos=ap_pos,
+            ue_pos=ue_pos,
+            large_scale=large_scale,
+            T_eval=T_eval,
+            p_max=p_max,
+            noise_power=noise_power,
+            seed_eval=seed_eval
+        )
+
+        # QGradual
+        rates_qgradual = evaluate_frl(
+            aps=aps_qgradual,
+            ap_pos=ap_pos,
+            ue_pos=ue_pos,
+            large_scale=large_scale,
+            T_eval=T_eval,
+            p_max=p_max,
+            noise_power=noise_power,
+            seed_eval=seed_eval
+        )
+
+        # Ganhos
+        ganho_fedavg, R_simple, R_fedavg = ganho_percentual_taxa(rates_simple, rates_fedavg)
+        ganho_qgradual_base, _, R_qgradual = ganho_percentual_taxa(rates_simple, rates_qgradual)
+        ganho_qgradual_fedavg = (R_qgradual - R_fedavg) / (R_fedavg + 1e-12) * 100.0
+
+        ganhos_fedavg_list.append(ganho_fedavg)
+        ganhos_qgradual_list.append(ganho_qgradual_base)
+        ganhos_qgradual_fedavg_list.append(ganho_qgradual_fedavg)
+
+        print(f"[Eval {exp+1}/{N_EVAL}] "
+              f"G_fedavg={ganho_fedavg:.2f}% | "
+              f"G_qgrad_base={ganho_qgradual_base:.2f}% | "
+              f"G_qgrad_vs_fedavg={ganho_qgradual_fedavg:.2f}%")
+
+    # ---------- Estatísticas finais ----------
     print("\n=======================================")
-    print("   COMPARAÇÃO: BASELINE x FRL-FedAvg x FRL-QGradual")
+    print("   ESTATÍSTICA SOBRE N AVALIAÇÕES")
     print("=======================================")
-    print(f"Taxa média por usuário (baseline)       = {R_simple:.4f} bps/Hz")
-    print(f"Taxa média por usuário (FRL-FedAvg)     = {R_fedavg:.4f} bps/Hz")
-    print(f"Taxa média por usuário (FRL-QGradual)   = {R_qgradual:.4f} bps/Hz")
-    print("---------------------------------------")
-    print(f"Ganho de taxa (FedAvg vs baseline)      = {ganho_fedavg:.2f}%")
-    print(f"Ganho de taxa (QGradual vs baseline)    = {ganho_qgradual_base:.2f}%")
-    print(f"Ganho de taxa (QGradual vs FedAvg)      = {ganho_qgradual_fedavg:.2f}%")
+    print("FedAvg vs baseline:  média = %.2f%%, std = %.2f"
+          % (np.mean(ganhos_fedavg_list), np.std(ganhos_fedavg_list)))
+    print("QGradual vs baseline: média = %.2f%%, std = %.2f"
+          % (np.mean(ganhos_qgradual_list), np.std(ganhos_qgradual_list)))
+    print("QGradual vs FedAvg:   média = %.2f%%, std = %.2f"
+          % (np.mean(ganhos_qgradual_fedavg_list), np.std(ganhos_qgradual_fedavg_list)))
