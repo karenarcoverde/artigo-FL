@@ -422,3 +422,5 @@ def reforco (SEED):
     print(f"Média / desvio padrão das particip.:  {participations.mean():.2f} / {participations.std():.2f}")
     print(f"Índice de Jain das participações:     {jain_part:.4f}")
     print("==============================================================\n")
+
+    return jain_part, acc * 100
