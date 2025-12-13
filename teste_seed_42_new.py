@@ -36,32 +36,35 @@ except Exception:
 # ============================================================
 # ===================== CONFIGS (ARTIGO) =====================
 # ============================================================
-NUM_AP = 16                 # M = 16 (fixo)
-K_USERS = 20                # K ∈ {20,40}
+NUM_AP = 16
+K_USERS = 20
 TOTAL_USERS = K_USERS
 
-# Treino local (mantido como estava no seu código)
 EPOCHS_LOCAL = 5
 EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
 
-# Validação / reforço
 VAL_SAMPLES = 5000
+
+# Mesmo que o baseline não use reward, mantemos as configs iguais
 LAMBDA_OVERFIT = 0.15
 TEMP = 0.9
 WEIGHT_FLOOR, WEIGHT_CEIL = 0.8, 1.2
-
 ALPHA_LEVEL = 0.7
 BETA_GAIN  = 0.3
 
-# Seleção top-K por AP
 USE_ALL_USERS_PER_AP = False
-K_PER_AP = 2
+K_PER_AP = 4
 
-# Exploração/justiça
 EPS = 0.05
 TEMP_SEL = 0.8
 FAIR_FRACTION = 0.25
+
+# ============================================================
+# ===================== BASELINE: SEM RL =====================
+# ============================================================
+USE_RL = False               # <<< DESLIGADO
+BASELINE_MODE = "linkfair"   # "random" ou "linkfair"
 
 # ============================================================
 # ============== “CELL-FREE” SEM PRÉ-FILTRO ==================
@@ -71,7 +74,7 @@ ap_users = {ap: list(range(TOTAL_USERS)) for ap in range(NUM_AP)}
 PATHLOSS_EXP = 3.7
 MIN_DIST = 0.02
 SHADOWING_STD_DB = 6.0
-LINK_QUALITY_GAMMA = 0.25  # peso do link no score
+LINK_QUALITY_GAMMA = 0.25
 
 def generate_beta_matrix(num_ap, num_ue, area_side=1.0,
                          pathloss_exp=3.7, min_dist=0.02, shadow_std_db=6.0, seed=42):
@@ -87,7 +90,7 @@ def generate_beta_matrix(num_ap, num_ue, area_side=1.0,
     shadow_db = rng.normal(0.0, shadow_std_db, size=pl.shape)
     shadow_lin = 10 ** (shadow_db / 10.0)
 
-    beta = pl * shadow_lin  # (M,K)
+    beta = pl * shadow_lin
     return beta
 
 beta_mk = generate_beta_matrix(
@@ -100,7 +103,6 @@ beta_mk = generate_beta_matrix(
     seed=SEED
 )
 
-# Normaliza beta por AP para virar link_quality[ap][ue] em [0,1]
 link_quality = {ap: {} for ap in range(NUM_AP)}
 for ap in range(NUM_AP):
     ues = ap_users[ap]
@@ -115,9 +117,6 @@ for ap in range(NUM_AP):
 
 # ============================================================
 # ===================== DADOS (IID) ==========================
-#   CORRIGIDO: usa TODO o CIFAR-10 treino (50k) e divide
-#   igualmente: |D_j| = |D|/K (igual ao artigo)
-#   + balanceado por classe (IID “perfeito”)
 # ============================================================
 (x_train, y_train), (x_test, y_test) = cifar10.load_data()
 x_train = x_train.astype("float32") / 255.0
@@ -125,25 +124,19 @@ x_test  = x_test.astype("float32") / 255.0
 y_train = y_train.squeeze().astype(np.int32)
 y_test  = y_test.squeeze().astype(np.int32)
 
-TOTAL_TRAIN = len(x_train)  # CIFAR-10 train = 50.000 (|D| do artigo)
+TOTAL_TRAIN = len(x_train)
 if TOTAL_TRAIN % TOTAL_USERS != 0:
     raise ValueError(
         f"|D|={TOTAL_TRAIN} não é divisível por K={TOTAL_USERS}. "
         f"No artigo, K∈{{20,40}} divide exatamente 50.000."
     )
 
-SAMPLES_PER_USER = TOTAL_TRAIN // TOTAL_USERS  # <-- IGUAL AO ARTIGO
+SAMPLES_PER_USER = TOTAL_TRAIN // TOTAL_USERS
 
 x_val = x_test[:VAL_SAMPLES]
 y_val = y_test[:VAL_SAMPLES]
 
 def make_iid_splits_by_class_full(x, y, K, seed=42):
-    """
-    IID balanceado por classe usando TODO o treino:
-    - CIFAR-10 tem 5000 amostras por classe
-    - K=20 -> 250 por classe por usuário (2500 total)
-    - K=40 -> 125 por classe por usuário (1250 total)
-    """
     rng = np.random.default_rng(seed)
     num_classes = int(np.max(y)) + 1
 
@@ -151,8 +144,6 @@ def make_iid_splits_by_class_full(x, y, K, seed=42):
     for c in range(num_classes):
         idx_c = np.where(y == c)[0]
         rng.shuffle(idx_c)
-
-        # round-robin garante mesma qtde por classe para todos
         for i, idx in enumerate(idx_c):
             per_user_idx[i % K].append(idx)
 
@@ -179,7 +170,7 @@ print(f"rho_j                         = 1/K = {1.0/TOTAL_USERS:.4f}")
 print("======================================\n")
 
 # ============================================================
-# ===================== MODELO (IGUAL AO ARTIGO) =============
+# ===================== MODELO ===============================
 # ============================================================
 def build_model(num_classes=10):
     model = Sequential([
@@ -190,34 +181,25 @@ def build_model(num_classes=10):
         Dense(num_classes, activation='softmax')
     ])
     model.compile(
-        optimizer='adam',  # mantido como estava no seu loop
+        optimizer='adam',
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
     return model
 
 # ============================================================
-# ===================== BANDIT (EMA) =========================
+# ===================== “BANDIT” (SEM APRENDER Q) ============
 # ============================================================
+# Mantemos a estrutura só para medir fairness (n e last_round)
 class BanditSelector:
-    def __init__(self, ap_to_users, ema_alpha=0.25):
-        self.ema_alpha = ema_alpha
+    def __init__(self, ap_to_users):
         self.n = defaultdict(lambda: defaultdict(int))
-        self.q = defaultdict(lambda: defaultdict(float))
         self.last_round = defaultdict(lambda: defaultdict(int))
         self.ap_to_users = ap_to_users
 
     def mark_participation(self, ap, uid, round_idx):
         self.n[ap][uid] += 1
         self.last_round[ap][uid] = round_idx
-
-    def update(self, ap, uid, reward):
-        q_old = self.q[ap][uid]
-        a = self.ema_alpha
-        self.q[ap][uid] = (1 - a) * q_old + a * float(reward)
-
-    def select_all(self, ap):
-        return self.ap_to_users[ap]
 
 # ============================================================
 # ===================== FEDAVG ===============================
@@ -233,30 +215,8 @@ def fedavg(weights_list, sizes):
         new_weights.append(np.sum(coeffs * stack, axis=0))
     return new_weights
 
-def weights_from_q_softmax(ap, qdict, users,
-                           floor=WEIGHT_FLOOR, ceil=WEIGHT_CEIL, temp=TEMP, eps=1e-9):
-    qs = np.array([qdict[ap][u] for u in users], dtype=np.float32)
-
-    if len(qs) >= 2:
-        mu, sigma = float(np.mean(qs)), float(np.std(qs) + 1e-9)
-        qs = np.clip(qs, mu - 2.0*sigma, mu + 2.0*sigma)
-
-    qs = (qs - np.max(qs))
-    sm = np.exp(qs / max(temp, 1e-3))
-    sm = sm / (np.sum(sm) + eps)
-    sm_scaled = sm * len(users)
-
-    smin, smax = float(np.min(sm_scaled)), float(np.max(sm_scaled))
-    if smax - smin < 1e-6:
-        return {u: 1.0 for u in users}
-
-    s01 = (sm_scaled - smin) / (smax - smin)
-    mults = floor + (ceil - floor) * s01
-    mults = mults / (float(np.mean(mults)) + eps)
-    return {u: float(m) for u, m in zip(users, mults)}
-
 # ============================================================
-# ===================== SELEÇÃO TOP-K ========================
+# ===================== SELEÇÃO TOP-K (SEM Q) =================
 # ============================================================
 def softmax_scores(vec, temp=1.0, eps=1e-9):
     v = np.array(vec, dtype=np.float32)
@@ -264,11 +224,11 @@ def softmax_scores(vec, temp=1.0, eps=1e-9):
     sm = np.exp(v / max(temp, 1e-3))
     return sm / (np.sum(sm) + eps)
 
-def select_topk_no_prefilter(ap, bandit, K, round_idx,
-                             candidates, link_q_dict,
-                             temp=TEMP_SEL, eps=EPS,
-                             fair_fraction=FAIR_FRACTION,
-                             gamma_link=LINK_QUALITY_GAMMA):
+def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
+                                      candidates, link_q_dict,
+                                      temp=TEMP_SEL, eps=EPS,
+                                      fair_fraction=FAIR_FRACTION,
+                                      gamma_link=LINK_QUALITY_GAMMA):
     users = candidates
     if len(users) == 0:
         return []
@@ -277,11 +237,15 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
     if K == len(users):
         return users[:]
 
+    # baseline aleatório puro
+    if BASELINE_MODE == "random":
+        return list(np.random.choice(users, size=K, replace=False))
+
+    # exploração (mesma ideia do RL)
     if np.random.rand() < eps:
         return list(np.random.choice(users, size=K, replace=False))
 
-    qs = np.array([bandit.q[ap][u] for u in users], dtype=np.float32)
-
+    # fairness = idade desde última participação
     ages = np.array(
         [round_idx - bandit.last_round[ap][u] if bandit.last_round[ap][u] else round_idx + 1
          for u in users], dtype=np.float32
@@ -289,11 +253,13 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
     if float(np.max(ages)) > 0:
         ages = ages / (float(np.max(ages)) + 1e-9)
 
+    # link quality
     lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
 
     fairness_boost = 0.10
-    scores = qs + fairness_boost * ages + gamma_link * lq
+    scores = fairness_boost * ages + gamma_link * lq  # <<< SEM q
 
+    # garante fração "fair" fixa
     k_fair = max(1, int(np.ceil(fair_fraction * K)))
     tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
     rank_fair = np.lexsort((tie, -ages))
@@ -302,11 +268,8 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
     remaining = K - len(fair_candidates)
     if remaining > 0:
         idx_map = {u:i for i,u in enumerate(users)}
-        mask = np.ones(len(users), dtype=bool)
-        for u in fair_candidates:
-            mask[idx_map[u]] = False
-
-        users_left = [u for u, m in zip(users, mask) if m]
+        chosen_set = set(fair_candidates)
+        users_left = [u for u in users if u not in chosen_set]
         probs_left = softmax_scores([scores[idx_map[u]] for u in users_left], temp=temp)
         chosen = list(np.random.choice(users_left, size=remaining, replace=False, p=probs_left))
         return fair_candidates + chosen
@@ -346,9 +309,9 @@ def pretty_num(x):
     return f"{x:.2f}E"
 
 # ============================================================
-# ===================== LOOP FEDERADO ========================
+# ===================== LOOP FEDERADO (BASELINE) =============
 # ============================================================
-bandit = BanditSelector(ap_users, ema_alpha=0.25)
+bandit = BanditSelector(ap_users)
 global_model = build_model(num_classes=10)
 
 n_params = count_params(global_model)
@@ -361,7 +324,8 @@ BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM
 print("\n===== CONFIG =====")
 print(f"M (APs) = {NUM_AP}")
 print(f"K (UEs) = {TOTAL_USERS}")
-print(f"|D_j| (amostras por UE) = {SAMPLES_PER_USER}  (igual ao artigo)\n")
+print(f"|D_j| (amostras por UE) = {SAMPLES_PER_USER}  (igual ao artigo)")
+print(f"USE_RL = {USE_RL} | BASELINE_MODE = {BASELINE_MODE} | K_PER_AP = {K_PER_AP}\n")
 
 print("===== MODELO =====")
 print(f"Parâmetros: {n_params:,}")
@@ -382,14 +346,12 @@ ALL_UES = list(range(TOTAL_USERS))
 for r in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {r+1}")
 
-    _, acc_val_global = global_model.evaluate(val_ds, verbose=0)
-
     selected_by_ap = {}
     for ap in range(NUM_AP):
         if USE_ALL_USERS_PER_AP:
             selected_by_ap[ap] = ALL_UES[:]
         else:
-            selected_by_ap[ap] = select_topk_no_prefilter(
+            selected_by_ap[ap] = select_topk_no_prefilter_baseline(
                 ap=ap,
                 bandit=bandit,
                 K=K_PER_AP,
@@ -424,25 +386,16 @@ for r in range(EPOCHS_GLOBAL):
                 shuffle=True
             )
 
-            _, acc_local = local_model.evaluate(x_u, y_u, verbose=0)
-            _, acc_val_u = local_model.evaluate(val_ds, verbose=0)
-
-            reward_level = float(acc_val_u)
-            reward_gain  = float(acc_val_u - acc_val_global)
-            reward = (
-                ALPHA_LEVEL * reward_level
-                + BETA_GAIN * reward_gain
-                - LAMBDA_OVERFIT * max(0.0, float(acc_local - acc_val_u))
-            )
-
-            local_cache[ap][uid] = (local_model.get_weights(), len(x_u), reward)
+            # baseline: não calcula reward nem atualiza q
+            local_cache[ap][uid] = (local_model.get_weights(), len(x_u))
             ue_participations[uid] += 1
 
+    # atualiza contadores p/ fairness (idade)
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             bandit.mark_participation(ap, uid, r)
-            bandit.update(ap, uid, local_cache[ap][uid][2])
 
+    # agrega por AP (FedAvg puro)
     ap_models_weights = []
     ap_sizes = []
     for ap in range(NUM_AP):
@@ -455,13 +408,11 @@ for r in range(EPOCHS_GLOBAL):
         weights_list = [local_cache[ap][uid][0] for uid in uids]
         sizes = [local_cache[ap][uid][1] for uid in uids]
 
-        mults = weights_from_q_softmax(ap, bandit.q, users=uids)
-        sizes_weighted = [n * mults[uid] for n, uid in zip(sizes, uids)]
-
-        ap_w = fedavg(weights_list, sizes_weighted)
+        ap_w = fedavg(weights_list, sizes)
         ap_models_weights.append(ap_w)
-        ap_sizes.append(float(np.sum(sizes_weighted)))
+        ap_sizes.append(float(np.sum(sizes)))
 
+    # agrega global
     new_global_weights = fedavg(ap_models_weights, ap_sizes)
     if new_global_weights is not None:
         global_model.set_weights(new_global_weights)
@@ -485,6 +436,7 @@ print(f"APs (M):                         {NUM_AP}")
 print(f"UEs totais (K):                  {TOTAL_USERS}  (K ∈ {{20,40}})")
 print(f"|D_j| (amostras por UE):          {SAMPLES_PER_USER}  (igual ao artigo)")
 print(f"K selecionados por AP:           {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
+print(f"USE_RL:                          {USE_RL} (baseline={BASELINE_MODE})")
 print(f"Parâmetros do modelo:            {n_params:,}")
 print(f"FLOPs/amostra (forward):         {pretty_num(infer_flops)}FLOPs")
 print(f"FLOPs/amostra (treino):          {pretty_num(train_flops_per_sample)}FLOPs (≈2.5×)")
