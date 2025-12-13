@@ -63,8 +63,8 @@ FAIR_FRACTION = 0.25
 # ============================================================
 # ===================== BASELINE: SEM RL =====================
 # ============================================================
-USE_RL = False               # <<< DESLIGADO
-BASELINE_MODE = "linkfair"   # "random" ou "linkfair"
+USE_RL = True               # (mantido como está no seu código)
+BASELINE_MODE = "linkfair"  # "random" ou "linkfair"
 
 # ============================================================
 # ============== “CELL-FREE” SEM PRÉ-FILTRO ==================
@@ -190,7 +190,6 @@ def build_model(num_classes=10):
 # ============================================================
 # ===================== “BANDIT” (SEM APRENDER Q) ============
 # ============================================================
-# Mantemos a estrutura só para medir fairness (n e last_round)
 class BanditSelector:
     def __init__(self, ap_to_users):
         self.n = defaultdict(lambda: defaultdict(int))
@@ -277,6 +276,57 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
     return fair_candidates[:K]
 
 # ============================================================
+# === NOVO: SELEÇÃO DISJUNTA (SEM UE REPETIDO EM VÁRIOS APs) ==
+# ============================================================
+def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
+    """
+    Garante que cada UE participe no máximo 1x por rodada:
+    - Seleciona por AP em sequência, consumindo um pool 'remaining'
+    - Quem foi escolhido por um AP sai do pool e não pode ser escolhido por outros APs
+    """
+    remaining = set(all_ues)
+    selected_by_ap = {}
+
+    for ap in range(NUM_AP):
+        if not remaining:
+            selected_by_ap[ap] = []
+            continue
+
+        # determinismo: candidatos em ordem fixa
+        candidates_ap = sorted(remaining)
+
+        if USE_ALL_USERS_PER_AP:
+            # distribui o restante entre APs restantes (sem duplicar)
+            ap_left = (NUM_AP - ap)
+            k_eff = int(math.ceil(len(candidates_ap) / ap_left))
+        else:
+            k_eff = min(K_PER_AP, len(candidates_ap))
+
+        chosen = select_topk_no_prefilter_baseline(
+            ap=ap,
+            bandit=bandit,
+            K=k_eff,
+            round_idx=round_idx,
+            candidates=candidates_ap,         # <<< chave: só os "não usados"
+            link_q_dict=link_quality[ap],
+            temp=TEMP_SEL,
+            eps=EPS,
+            fair_fraction=FAIR_FRACTION,
+            gamma_link=LINK_QUALITY_GAMMA
+        )
+
+        # remove duplicatas internas (segurança)
+        chosen = list(dict.fromkeys(chosen))
+
+        selected_by_ap[ap] = chosen
+
+        # consome do pool => impede repetir em outros APs
+        for uid in chosen:
+            remaining.discard(uid)
+
+    return selected_by_ap
+
+# ============================================================
 # =======  MÉTRICAS DE FLOPs / PARÂMETROS / TRÁFEGO  =========
 # ============================================================
 def count_params(model):
@@ -346,34 +396,23 @@ ALL_UES = list(range(TOTAL_USERS))
 for r in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {r+1}")
 
-    selected_by_ap = {}
-    for ap in range(NUM_AP):
-        if USE_ALL_USERS_PER_AP:
-            selected_by_ap[ap] = ALL_UES[:]
-        else:
-            selected_by_ap[ap] = select_topk_no_prefilter_baseline(
-                ap=ap,
-                bandit=bandit,
-                K=K_PER_AP,
-                round_idx=r,
-                candidates=ALL_UES,
-                link_q_dict=link_quality[ap],
-                temp=TEMP_SEL,
-                eps=EPS,
-                fair_fraction=FAIR_FRACTION,
-                gamma_link=LINK_QUALITY_GAMMA
-            )
+    # ============================================================
+    # >>> AQUI: seleção disjunta (elimina UE repetido em vários APs)
+    # ============================================================
+    selected_by_ap = select_disjoint_by_ap_round(bandit, r, ALL_UES)
 
-    selected_union = sorted(set(u for ap in range(NUM_AP) for u in selected_by_ap[ap]))
+    # UEs únicos (agora = total real da rodada, pois é disjunto)
+    selected_union = sorted(set(u for uids in selected_by_ap.values() for u in uids))
     num_ues_unique_round = len(selected_union)
 
-    local_cache = {ap: {} for ap in range(NUM_AP)}
-    total_selected_instances = 0
+    # agora não há redundância: total_selected_instances = soma dos tamanhos
+    total_selected_instances = sum(len(uids) for uids in selected_by_ap.values())
 
+    local_cache = {ap: {} for ap in range(NUM_AP)}
+
+    # treina somente 1x por rodada por UE (por construção, já está garantido)
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
-            total_selected_instances += 1
-
             local_model = build_model(num_classes=10)
             local_model.set_weights(global_model.get_weights())
 
@@ -386,7 +425,6 @@ for r in range(EPOCHS_GLOBAL):
                 shuffle=True
             )
 
-            # baseline: não calcula reward nem atualiza q
             local_cache[ap][uid] = (local_model.get_weights(), len(x_u))
             ue_participations[uid] += 1
 
