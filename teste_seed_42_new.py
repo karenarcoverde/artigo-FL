@@ -63,8 +63,8 @@ FAIR_FRACTION = 0.25
 # ============================================================
 # ===================== BASELINE: SEM RL =====================
 # ============================================================
-USE_RL = True               # (mantido como está no seu código)
-BASELINE_MODE = "linkfair"  # "random" ou "linkfair"
+USE_RL = False
+BASELINE_MODE = "channel"   # "random" | "linkfair" | "channel"
 
 # ============================================================
 # ============== “CELL-FREE” SEM PRÉ-FILTRO ==================
@@ -215,7 +215,7 @@ def fedavg(weights_list, sizes):
     return new_weights
 
 # ============================================================
-# ===================== SELEÇÃO TOP-K (SEM Q) =================
+# ===================== SELEÇÃO TOP-K ========================
 # ============================================================
 def softmax_scores(vec, temp=1.0, eps=1e-9):
     v = np.array(vec, dtype=np.float32)
@@ -236,15 +236,33 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
     if K == len(users):
         return users[:]
 
-    # baseline aleatório puro
+    # ---------------------------------------------------------
+    # (A) baseline aleatório puro
+    # ---------------------------------------------------------
     if BASELINE_MODE == "random":
         return list(np.random.choice(users, size=K, replace=False))
 
-    # exploração (mesma ideia do RL)
+    # ---------------------------------------------------------
+    # (B) baseline por canal (link_quality)  <<< VOCÊ QUER ISSO
+    # ---------------------------------------------------------
+    if BASELINE_MODE == "channel":
+        # exploração opcional
+        if np.random.rand() < eps:
+            return list(np.random.choice(users, size=K, replace=False))
+
+        lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
+        tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
+
+        # maior canal primeiro; empate -> menor nº participações
+        order = np.lexsort((tie, -lq))
+        return [users[i] for i in order[:K]]
+
+    # ---------------------------------------------------------
+    # (C) modo antigo "linkfair"
+    # ---------------------------------------------------------
     if np.random.rand() < eps:
         return list(np.random.choice(users, size=K, replace=False))
 
-    # fairness = idade desde última participação
     ages = np.array(
         [round_idx - bandit.last_round[ap][u] if bandit.last_round[ap][u] else round_idx + 1
          for u in users], dtype=np.float32
@@ -252,13 +270,11 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
     if float(np.max(ages)) > 0:
         ages = ages / (float(np.max(ages)) + 1e-9)
 
-    # link quality
     lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
 
     fairness_boost = 0.10
-    scores = fairness_boost * ages + gamma_link * lq  # <<< SEM q
+    scores = fairness_boost * ages + gamma_link * lq
 
-    # garante fração "fair" fixa
     k_fair = max(1, int(np.ceil(fair_fraction * K)))
     tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
     rank_fair = np.lexsort((tie, -ages))
@@ -276,14 +292,9 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
     return fair_candidates[:K]
 
 # ============================================================
-# === NOVO: SELEÇÃO DISJUNTA (SEM UE REPETIDO EM VÁRIOS APs) ==
+# === SELEÇÃO DISJUNTA (SEM UE REPETIDO EM VÁRIOS APs) ========
 # ============================================================
 def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
-    """
-    Garante que cada UE participe no máximo 1x por rodada:
-    - Seleciona por AP em sequência, consumindo um pool 'remaining'
-    - Quem foi escolhido por um AP sai do pool e não pode ser escolhido por outros APs
-    """
     remaining = set(all_ues)
     selected_by_ap = {}
 
@@ -292,11 +303,9 @@ def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
             selected_by_ap[ap] = []
             continue
 
-        # determinismo: candidatos em ordem fixa
         candidates_ap = sorted(remaining)
 
         if USE_ALL_USERS_PER_AP:
-            # distribui o restante entre APs restantes (sem duplicar)
             ap_left = (NUM_AP - ap)
             k_eff = int(math.ceil(len(candidates_ap) / ap_left))
         else:
@@ -307,7 +316,7 @@ def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
             bandit=bandit,
             K=k_eff,
             round_idx=round_idx,
-            candidates=candidates_ap,         # <<< chave: só os "não usados"
+            candidates=candidates_ap,
             link_q_dict=link_quality[ap],
             temp=TEMP_SEL,
             eps=EPS,
@@ -315,12 +324,9 @@ def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
             gamma_link=LINK_QUALITY_GAMMA
         )
 
-        # remove duplicatas internas (segurança)
         chosen = list(dict.fromkeys(chosen))
-
         selected_by_ap[ap] = chosen
 
-        # consome do pool => impede repetir em outros APs
         for uid in chosen:
             remaining.discard(uid)
 
@@ -359,7 +365,7 @@ def pretty_num(x):
     return f"{x:.2f}E"
 
 # ============================================================
-# ===================== LOOP FEDERADO (BASELINE) =============
+# ===================== LOOP FEDERADO ========================
 # ============================================================
 bandit = BanditSelector(ap_users)
 global_model = build_model(num_classes=10)
@@ -396,21 +402,15 @@ ALL_UES = list(range(TOTAL_USERS))
 for r in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {r+1}")
 
-    # ============================================================
-    # >>> AQUI: seleção disjunta (elimina UE repetido em vários APs)
-    # ============================================================
+    # seleção disjunta: cada UE no máximo 1 AP por rodada
     selected_by_ap = select_disjoint_by_ap_round(bandit, r, ALL_UES)
 
-    # UEs únicos (agora = total real da rodada, pois é disjunto)
     selected_union = sorted(set(u for uids in selected_by_ap.values() for u in uids))
     num_ues_unique_round = len(selected_union)
-
-    # agora não há redundância: total_selected_instances = soma dos tamanhos
     total_selected_instances = sum(len(uids) for uids in selected_by_ap.values())
 
     local_cache = {ap: {} for ap in range(NUM_AP)}
 
-    # treina somente 1x por rodada por UE (por construção, já está garantido)
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             local_model = build_model(num_classes=10)
@@ -428,12 +428,10 @@ for r in range(EPOCHS_GLOBAL):
             local_cache[ap][uid] = (local_model.get_weights(), len(x_u))
             ue_participations[uid] += 1
 
-    # atualiza contadores p/ fairness (idade)
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             bandit.mark_participation(ap, uid, r)
 
-    # agrega por AP (FedAvg puro)
     ap_models_weights = []
     ap_sizes = []
     for ap in range(NUM_AP):
@@ -450,7 +448,6 @@ for r in range(EPOCHS_GLOBAL):
         ap_models_weights.append(ap_w)
         ap_sizes.append(float(np.sum(sizes)))
 
-    # agrega global
     new_global_weights = fedavg(ap_models_weights, ap_sizes)
     if new_global_weights is not None:
         global_model.set_weights(new_global_weights)
