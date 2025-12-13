@@ -6,6 +6,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from sklearn.model_selection import train_test_split
 from collections import defaultdict
+from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2_as_graph
 
 # ============================================================
 # ===================== FAIRNESS (JAIN) ======================
@@ -242,7 +243,7 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
                              fair_fraction=FAIR_FRACTION,
                              gamma_link=LINK_QUALITY_GAMMA):
     """
-    Agora: candidates = TODOS os UEs (0..K-1), sem filtro prévio.
+    candidates = TODOS os UEs (0..K-1), sem pré-filtro.
     Score = Q(ap,ue) + 0.10*recência + gamma*qualidade_link
     """
     users = candidates
@@ -294,8 +295,6 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
 # ============================================================
 # =======  MÉTRICAS DE FLOPs / PARÂMETROS / TRÁFEGO  =========
 # ============================================================
-from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2_as_graph
-
 def count_params(model):
     return int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
 
@@ -336,7 +335,7 @@ infer_flops = inference_flops_tf(global_model)
 train_flops_per_sample = train_flops_per_sample_from_infer(infer_flops)
 
 BYTES_PER_PARAM = 4
-BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM
+BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM  # download+upload do modelo
 
 print("\n===== CONFIG (ARTIGO) =====")
 print(f"M (APs) = {NUM_AP}")
@@ -350,11 +349,12 @@ print(f"FLOPs/amostra (treino):  {pretty_num(train_flops_per_sample)}FLOPs (≈2
 val_ds  = tf.data.Dataset.from_tensor_slices((x_val,  y_val)).batch(BATCH_SIZE)
 test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(BATCH_SIZE)
 
+# Agora: participação conta TREINOS (AP,UE). Se UE for escolhido por 3 APs na mesma rodada => +3.
 ue_participations = np.zeros(TOTAL_USERS, dtype=np.int32)
 
 total_flops_all_rounds = 0.0
 total_bytes_all_rounds = 0.0
-total_selected_updates = 0
+total_selected_updates = 0  # soma de instâncias (AP,UE) treinadas em todas as rodadas
 
 ALL_UES = list(range(TOTAL_USERS))
 
@@ -382,37 +382,48 @@ for r in range(EPOCHS_GLOBAL):
                 gamma_link=LINK_QUALITY_GAMMA
             )
 
-    # 2) união: cada UE treina no máximo 1x por rodada
+    # (Só estatística) quantos UEs ÚNICOS apareceram na rodada
     selected_union = sorted(set(u for ap in range(NUM_AP) for u in selected_by_ap[ap]))
-    num_ues_round = len(selected_union)
+    num_ues_unique_round = len(selected_union)
 
-    # 3) treino local (1x por UE) e recompensa
-    local_cache = {}
-    for uid in selected_union:
-        local_model = build_model()
-        local_model.set_weights(global_model.get_weights())
+    # 2) treino local AGORA É POR (AP, UE) => UE pode treinar várias vezes na mesma rodada
+    local_cache = {ap: {} for ap in range(NUM_AP)}  # local_cache[ap][uid] = (weights, size, reward)
+    total_selected_instances = 0  # quantos treinamentos (com repetição) na rodada
 
-        x_u, y_u = user_data[uid]
-        local_model.fit(x_u, y_u, epochs=EPOCHS_LOCAL, batch_size=BATCH_SIZE, verbose=0, shuffle=True)
+    for ap in range(NUM_AP):
+        for uid in selected_by_ap[ap]:
+            total_selected_instances += 1
 
-        _, acc_local = local_model.evaluate(x_u, y_u, verbose=0)
-        _, acc_val_u = local_model.evaluate(val_ds, verbose=0)
+            local_model = build_model()
+            local_model.set_weights(global_model.get_weights())
 
-        reward_level = float(acc_val_u)
-        reward_gain  = float(acc_val_u - acc_val_global)
-        reward = ALPHA_LEVEL * reward_level + BETA_GAIN * reward_gain \
-                 - LAMBDA_OVERFIT * max(0.0, float(acc_local - acc_val_u))
+            x_u, y_u = user_data[uid]
+            local_model.fit(
+                x_u, y_u,
+                epochs=EPOCHS_LOCAL,
+                batch_size=BATCH_SIZE,
+                verbose=0,
+                shuffle=True
+            )
 
-        local_cache[uid] = (local_model.get_weights(), len(x_u), reward)
-        ue_participations[uid] += 1
+            _, acc_local = local_model.evaluate(x_u, y_u, verbose=0)
+            _, acc_val_u = local_model.evaluate(val_ds, verbose=0)
 
-    # 4) atualiza bandit por AP apenas para quem ele selecionou
+            reward_level = float(acc_val_u)
+            reward_gain  = float(acc_val_u - acc_val_global)
+            reward = ALPHA_LEVEL * reward_level + BETA_GAIN * reward_gain \
+                     - LAMBDA_OVERFIT * max(0.0, float(acc_local - acc_val_u))
+
+            local_cache[ap][uid] = (local_model.get_weights(), len(x_u), reward)
+            ue_participations[uid] += 1  # conta treinos, não apenas "rodadas"
+
+    # 3) atualiza bandit por AP usando a recompensa do treino daquele AP
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             bandit.mark_participation(ap, uid, r)
-            bandit.update(ap, uid, local_cache[uid][2])
+            bandit.update(ap, uid, local_cache[ap][uid][2])
 
-    # 5) agregação por AP e depois global
+    # 4) agregação por AP e depois global
     ap_models_weights = []
     ap_sizes = []
     for ap in range(NUM_AP):
@@ -422,8 +433,8 @@ for r in range(EPOCHS_GLOBAL):
             ap_sizes.append(0.0)
             continue
 
-        weights_list = [local_cache[uid][0] for uid in uids]
-        sizes = [local_cache[uid][1] for uid in uids]
+        weights_list = [local_cache[ap][uid][0] for uid in uids]
+        sizes = [local_cache[ap][uid][1] for uid in uids]
 
         mults = weights_from_q_softmax(ap, bandit.q, users=uids)
         sizes_weighted = [n * mults[uid] for n, uid in zip(sizes, uids)]
@@ -436,16 +447,16 @@ for r in range(EPOCHS_GLOBAL):
     if new_global_weights is not None:
         global_model.set_weights(new_global_weights)
 
-    # 6) FLOPs/Bytes (treino conta 1x por UE na rodada)
-    flops_this_round = train_flops_per_sample * SAMPLES_PER_USER * EPOCHS_LOCAL * num_ues_round
-    bytes_this_round = BYTES_PER_UE_PER_ROUND * num_ues_round
+    # 5) FLOPs/Bytes (agora contam INSTÂNCIAS (AP,UE), com repetição)
+    flops_this_round = train_flops_per_sample * SAMPLES_PER_USER * EPOCHS_LOCAL * total_selected_instances
+    bytes_this_round = BYTES_PER_UE_PER_ROUND * total_selected_instances
 
     total_flops_all_rounds += flops_this_round
     total_bytes_all_rounds += bytes_this_round
-    total_selected_updates += num_ues_round
+    total_selected_updates += total_selected_instances
 
     _, acc_r = global_model.evaluate(test_ds, verbose=0)
-    print(f"   ↳ UEs únicos na rodada: {num_ues_round} | acc={acc_r*100:.2f}%")
+    print(f"   ↳ UEs únicos na rodada: {num_ues_unique_round} | treinos (AP,UE): {total_selected_instances} | acc={acc_r*100:.2f}%")
     print(f"   ↳ FLOPs rodada: {pretty_num(flops_this_round)} | Bytes (↓↑): {bytes_this_round/1e6:.2f} MB")
 
 # ============================================================
@@ -461,14 +472,14 @@ print(f"K selecionados por AP:           {'ALL' if USE_ALL_USERS_PER_AP else K_P
 print(f"Parâmetros do modelo:            {n_params:,}")
 print(f"FLOPs/amostra (forward):         {pretty_num(infer_flops)}FLOPs")
 print(f"FLOPs/amostra (treino):          {pretty_num(train_flops_per_sample)}FLOPs (≈2.5×)")
-print(f"Total de UEs únicos somados:     {total_selected_updates}")
+print(f"Total de treinos (AP,UE) somados:{total_selected_updates}")
 print(f"FLOPs totais (treino local):     {pretty_num(total_flops_all_rounds)}FLOPs")
 print(f"Bytes totais (↓↑, float32):      {total_bytes_all_rounds/1e6:.2f} MB")
 print("=========================================================\n")
 
 jain_part = jain_index(ue_participations)
 print("\n==================== FAIRNESS DE PARTICIPAÇÃO (POR UE) ====================")
-print(f"Participações mín / máx:              {ue_participations.min():.0f} / {ue_participations.max():.0f}")
-print(f"Média / desvio padrão das particip.:  {ue_participations.mean():.2f} / {ue_participations.std():.2f}")
-print(f"Índice de Jain das participações:     {jain_part:.4f}")
+print(f"Participações (treinos) mín / máx:     {ue_participations.min():.0f} / {ue_participations.max():.0f}")
+print(f"Média / desvio padrão:                {ue_participations.mean():.2f} / {ue_participations.std():.2f}")
+print(f"Índice de Jain (treinos por UE):       {jain_part:.4f}")
 print("============================================================================\n")
