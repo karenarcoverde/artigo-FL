@@ -56,7 +56,7 @@ BETA_GAIN  = 0.3
 
 # Seleção top-K por AP
 USE_ALL_USERS_PER_AP = False
-K_PER_AP = 4
+K_PER_AP = 2
 
 # Exploração/justiça
 EPS = 0.05
