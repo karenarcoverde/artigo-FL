@@ -4,7 +4,6 @@ import tensorflow as tf
 from tensorflow.keras.datasets import cifar10
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
-from sklearn.model_selection import train_test_split
 from collections import defaultdict
 from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2_as_graph
 
@@ -38,11 +37,10 @@ except Exception:
 # ===================== CONFIGS (ARTIGO) =====================
 # ============================================================
 NUM_AP = 16                 # M = 16 (fixo)
-K_USERS = 20                # K ∈ {20,40}  <<< troque p/ 40 quando quiser
-TOTAL_USERS = K_USERS       # total real de UEs (K)
+K_USERS = 20                # K ∈ {20,40}
+TOTAL_USERS = K_USERS
 
-# Treino local
-SAMPLES_PER_USER = 300
+# Treino local (mantido como estava no seu código)
 EPOCHS_LOCAL = 5
 EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
@@ -68,10 +66,8 @@ FAIR_FRACTION = 0.25
 # ============================================================
 # ============== “CELL-FREE” SEM PRÉ-FILTRO ==================
 # ============================================================
-# Aqui: cada AP pode escolher entre TODOS os K UEs
 ap_users = {ap: list(range(TOTAL_USERS)) for ap in range(NUM_AP)}
 
-# (Opcional) ainda usamos um beta_{m,k} só para dar "qualidade de link"
 PATHLOSS_EXP = 3.7
 MIN_DIST = 0.02
 SHADOWING_STD_DB = 6.0
@@ -107,7 +103,7 @@ beta_mk = generate_beta_matrix(
 # Normaliza beta por AP para virar link_quality[ap][ue] em [0,1]
 link_quality = {ap: {} for ap in range(NUM_AP)}
 for ap in range(NUM_AP):
-    ues = ap_users[ap]  # todos
+    ues = ap_users[ap]
     b = np.array([beta_mk[ap, u] for u in ues], dtype=np.float32)
     bmin, bmax = float(np.min(b)), float(np.max(b))
     if (bmax - bmin) < 1e-12:
@@ -119,54 +115,85 @@ for ap in range(NUM_AP):
 
 # ============================================================
 # ===================== DADOS (IID) ==========================
+#   CORRIGIDO: usa TODO o CIFAR-10 treino (50k) e divide
+#   igualmente: |D_j| = |D|/K (igual ao artigo)
+#   + balanceado por classe (IID “perfeito”)
 # ============================================================
 (x_train, y_train), (x_test, y_test) = cifar10.load_data()
 x_train = x_train.astype("float32") / 255.0
 x_test  = x_test.astype("float32") / 255.0
+y_train = y_train.squeeze().astype(np.int32)
+y_test  = y_test.squeeze().astype(np.int32)
 
-TOTAL_TRAIN = TOTAL_USERS * SAMPLES_PER_USER
-if TOTAL_TRAIN > len(x_train):
+TOTAL_TRAIN = len(x_train)  # CIFAR-10 train = 50.000 (|D| do artigo)
+if TOTAL_TRAIN % TOTAL_USERS != 0:
     raise ValueError(
-        f"TOTAL_TRAIN={TOTAL_TRAIN} excede CIFAR-10 train={len(x_train)}. "
-        f"Reduza SAMPLES_PER_USER ou K_USERS."
+        f"|D|={TOTAL_TRAIN} não é divisível por K={TOTAL_USERS}. "
+        f"No artigo, K∈{{20,40}} divide exatamente 50.000."
     )
 
-x_pool, _, y_pool, _ = train_test_split(
-    x_train, y_train,
-    train_size=TOTAL_TRAIN,
-    stratify=y_train,
-    random_state=SEED,
-    shuffle=True
-)
-
-rng = np.random.default_rng(SEED)
-perm = rng.permutation(TOTAL_TRAIN)
-x_pool = x_pool[perm]
-y_pool = y_pool[perm]
-
-user_data = []
-for u in range(TOTAL_USERS):
-    s = u * SAMPLES_PER_USER
-    e = (u + 1) * SAMPLES_PER_USER
-    user_data.append((x_pool[s:e], y_pool[s:e]))
+SAMPLES_PER_USER = TOTAL_TRAIN // TOTAL_USERS  # <-- IGUAL AO ARTIGO
 
 x_val = x_test[:VAL_SAMPLES]
 y_val = y_test[:VAL_SAMPLES]
 
+def make_iid_splits_by_class_full(x, y, K, seed=42):
+    """
+    IID balanceado por classe usando TODO o treino:
+    - CIFAR-10 tem 5000 amostras por classe
+    - K=20 -> 250 por classe por usuário (2500 total)
+    - K=40 -> 125 por classe por usuário (1250 total)
+    """
+    rng = np.random.default_rng(seed)
+    num_classes = int(np.max(y)) + 1
+
+    per_user_idx = [[] for _ in range(K)]
+    for c in range(num_classes):
+        idx_c = np.where(y == c)[0]
+        rng.shuffle(idx_c)
+
+        # round-robin garante mesma qtde por classe para todos
+        for i, idx in enumerate(idx_c):
+            per_user_idx[i % K].append(idx)
+
+    user_data_local = []
+    sizes = []
+    for u in range(K):
+        idx_u = np.array(per_user_idx[u], dtype=np.int32)
+        rng.shuffle(idx_u)
+        user_data_local.append((x[idx_u], y[idx_u]))
+        sizes.append(len(idx_u))
+
+    if len(set(sizes)) != 1:
+        raise RuntimeError(f"Partição IID não ficou igual: sizes={sizes}")
+
+    return user_data_local
+
+user_data = make_iid_splits_by_class_full(x_train, y_train, K=TOTAL_USERS, seed=SEED)
+
+print("\n===== DADOS (IID igual ao artigo) =====")
+print(f"|D| (total treino CIFAR-10)  = {TOTAL_TRAIN}")
+print(f"K (usuários)                 = {TOTAL_USERS}")
+print(f"|D_j| por usuário             = {SAMPLES_PER_USER}  (|D|/K)")
+print(f"rho_j                         = 1/K = {1.0/TOTAL_USERS:.4f}")
+print("======================================\n")
+
 # ============================================================
-# ===================== MODELO BASE ==========================
+# ===================== MODELO (IGUAL AO ARTIGO) =============
 # ============================================================
-def build_model():
+def build_model(num_classes=10):
     model = Sequential([
         Conv2D(32, (3,3), activation='relu', input_shape=(32,32,3)),
         MaxPooling2D((2,2)),
         Flatten(),
         Dense(64, activation='relu'),
-        Dense(10, activation='softmax')
+        Dense(num_classes, activation='softmax')
     ])
-    model.compile(optimizer='adam',
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'])
+    model.compile(
+        optimizer='adam',  # mantido como estava no seu loop
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
     return model
 
 # ============================================================
@@ -242,10 +269,6 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
                              temp=TEMP_SEL, eps=EPS,
                              fair_fraction=FAIR_FRACTION,
                              gamma_link=LINK_QUALITY_GAMMA):
-    """
-    candidates = TODOS os UEs (0..K-1), sem pré-filtro.
-    Score = Q(ap,ue) + 0.10*recência + gamma*qualidade_link
-    """
     users = candidates
     if len(users) == 0:
         return []
@@ -254,7 +277,6 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
     if K == len(users):
         return users[:]
 
-    # exploração total ocasional
     if np.random.rand() < eps:
         return list(np.random.choice(users, size=K, replace=False))
 
@@ -272,10 +294,9 @@ def select_topk_no_prefilter(ap, bandit, K, round_idx,
     fairness_boost = 0.10
     scores = qs + fairness_boost * ages + gamma_link * lq
 
-    # reserva fairness por recência
     k_fair = max(1, int(np.ceil(fair_fraction * K)))
     tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
-    rank_fair = np.lexsort((tie, -ages))   # age desc, tie n asc
+    rank_fair = np.lexsort((tie, -ages))
     fair_candidates = [users[i] for i in rank_fair[:k_fair]]
 
     remaining = K - len(fair_candidates)
@@ -328,18 +349,19 @@ def pretty_num(x):
 # ===================== LOOP FEDERADO ========================
 # ============================================================
 bandit = BanditSelector(ap_users, ema_alpha=0.25)
-global_model = build_model()
+global_model = build_model(num_classes=10)
 
 n_params = count_params(global_model)
 infer_flops = inference_flops_tf(global_model)
 train_flops_per_sample = train_flops_per_sample_from_infer(infer_flops)
 
 BYTES_PER_PARAM = 4
-BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM  # download+upload do modelo
+BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM
 
-print("\n===== CONFIG (ARTIGO) =====")
+print("\n===== CONFIG =====")
 print(f"M (APs) = {NUM_AP}")
-print(f"K (UEs) = {TOTAL_USERS}\n")
+print(f"K (UEs) = {TOTAL_USERS}")
+print(f"|D_j| (amostras por UE) = {SAMPLES_PER_USER}  (igual ao artigo)\n")
 
 print("===== MODELO =====")
 print(f"Parâmetros: {n_params:,}")
@@ -349,12 +371,11 @@ print(f"FLOPs/amostra (treino):  {pretty_num(train_flops_per_sample)}FLOPs (≈2
 val_ds  = tf.data.Dataset.from_tensor_slices((x_val,  y_val)).batch(BATCH_SIZE)
 test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(BATCH_SIZE)
 
-# Agora: participação conta TREINOS (AP,UE). Se UE for escolhido por 3 APs na mesma rodada => +3.
 ue_participations = np.zeros(TOTAL_USERS, dtype=np.int32)
 
 total_flops_all_rounds = 0.0
 total_bytes_all_rounds = 0.0
-total_selected_updates = 0  # soma de instâncias (AP,UE) treinadas em todas as rodadas
+total_selected_updates = 0
 
 ALL_UES = list(range(TOTAL_USERS))
 
@@ -363,7 +384,6 @@ for r in range(EPOCHS_GLOBAL):
 
     _, acc_val_global = global_model.evaluate(val_ds, verbose=0)
 
-    # 1) cada AP seleciona entre TODOS os UEs (sem pré-filtro)
     selected_by_ap = {}
     for ap in range(NUM_AP):
         if USE_ALL_USERS_PER_AP:
@@ -382,19 +402,17 @@ for r in range(EPOCHS_GLOBAL):
                 gamma_link=LINK_QUALITY_GAMMA
             )
 
-    # (Só estatística) quantos UEs ÚNICOS apareceram na rodada
     selected_union = sorted(set(u for ap in range(NUM_AP) for u in selected_by_ap[ap]))
     num_ues_unique_round = len(selected_union)
 
-    # 2) treino local AGORA É POR (AP, UE) => UE pode treinar várias vezes na mesma rodada
-    local_cache = {ap: {} for ap in range(NUM_AP)}  # local_cache[ap][uid] = (weights, size, reward)
-    total_selected_instances = 0  # quantos treinamentos (com repetição) na rodada
+    local_cache = {ap: {} for ap in range(NUM_AP)}
+    total_selected_instances = 0
 
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             total_selected_instances += 1
 
-            local_model = build_model()
+            local_model = build_model(num_classes=10)
             local_model.set_weights(global_model.get_weights())
 
             x_u, y_u = user_data[uid]
@@ -411,19 +429,20 @@ for r in range(EPOCHS_GLOBAL):
 
             reward_level = float(acc_val_u)
             reward_gain  = float(acc_val_u - acc_val_global)
-            reward = ALPHA_LEVEL * reward_level + BETA_GAIN * reward_gain \
-                     - LAMBDA_OVERFIT * max(0.0, float(acc_local - acc_val_u))
+            reward = (
+                ALPHA_LEVEL * reward_level
+                + BETA_GAIN * reward_gain
+                - LAMBDA_OVERFIT * max(0.0, float(acc_local - acc_val_u))
+            )
 
             local_cache[ap][uid] = (local_model.get_weights(), len(x_u), reward)
-            ue_participations[uid] += 1  # conta treinos, não apenas "rodadas"
+            ue_participations[uid] += 1
 
-    # 3) atualiza bandit por AP usando a recompensa do treino daquele AP
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             bandit.mark_participation(ap, uid, r)
             bandit.update(ap, uid, local_cache[ap][uid][2])
 
-    # 4) agregação por AP e depois global
     ap_models_weights = []
     ap_sizes = []
     for ap in range(NUM_AP):
@@ -447,7 +466,6 @@ for r in range(EPOCHS_GLOBAL):
     if new_global_weights is not None:
         global_model.set_weights(new_global_weights)
 
-    # 5) FLOPs/Bytes (agora contam INSTÂNCIAS (AP,UE), com repetição)
     flops_this_round = train_flops_per_sample * SAMPLES_PER_USER * EPOCHS_LOCAL * total_selected_instances
     bytes_this_round = BYTES_PER_UE_PER_ROUND * total_selected_instances
 
@@ -456,18 +474,16 @@ for r in range(EPOCHS_GLOBAL):
     total_selected_updates += total_selected_instances
 
     _, acc_r = global_model.evaluate(test_ds, verbose=0)
-    print(f"   ↳ UEs únicos na rodada: {num_ues_unique_round} | treinos (AP,UE): {total_selected_instances} | acc={acc_r*100:.2f}%")
-    print(f"   ↳ FLOPs rodada: {pretty_num(flops_this_round)} | Bytes (↓↑): {bytes_this_round/1e6:.2f} MB")
+    print(f"   ↳ UEs únicos: {num_ues_unique_round} | treinos (AP,UE): {total_selected_instances} | acc={acc_r*100:.2f}%")
+    print(f"   ↳ FLOPs: {pretty_num(flops_this_round)} | Bytes (↓↑): {bytes_this_round/1e6:.2f} MB")
 
-# ============================================================
-# ===================== RELATÓRIO FINAL ======================
-# ============================================================
-loss, acc = global_model.evaluate(test_ds, verbose=2)
+loss, acc = global_model.evaluate(test_ds, verbose=0)
 print(f"\n🎯 Acurácia final do modelo global: {acc * 100:.2f}%")
 
 print("\n==================== RELATÓRIO FINAL ====================")
 print(f"APs (M):                         {NUM_AP}")
 print(f"UEs totais (K):                  {TOTAL_USERS}  (K ∈ {{20,40}})")
+print(f"|D_j| (amostras por UE):          {SAMPLES_PER_USER}  (igual ao artigo)")
 print(f"K selecionados por AP:           {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
 print(f"Parâmetros do modelo:            {n_params:,}")
 print(f"FLOPs/amostra (forward):         {pretty_num(infer_flops)}FLOPs")
@@ -478,7 +494,7 @@ print(f"Bytes totais (↓↑, float32):      {total_bytes_all_rounds/1e6:.2f} MB
 print("=========================================================\n")
 
 jain_part = jain_index(ue_participations)
-print("\n==================== FAIRNESS DE PARTICIPAÇÃO (POR UE) ====================")
+print("==================== FAIRNESS DE PARTICIPAÇÃO (POR UE) ====================")
 print(f"Participações (treinos) mín / máx:     {ue_participations.min():.0f} / {ue_participations.max():.0f}")
 print(f"Média / desvio padrão:                {ue_participations.mean():.2f} / {ue_participations.std():.2f}")
 print(f"Índice de Jain (treinos por UE):       {jain_part:.4f}")
