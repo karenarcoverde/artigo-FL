@@ -40,18 +40,12 @@ NUM_AP = 16
 K_USERS = 20
 TOTAL_USERS = K_USERS
 
-EPOCHS_LOCAL = 5
+EPOCHS_LOCAL  = 5
 EPOCHS_GLOBAL = 30
 BATCH_SIZE = 64
-
 VAL_SAMPLES = 5000
 
-# Mesmo que o baseline não use reward, mantemos as configs iguais
-LAMBDA_OVERFIT = 0.15
-TEMP = 0.9
-WEIGHT_FLOOR, WEIGHT_CEIL = 0.8, 1.2
 ALPHA_LEVEL = 0.7
-BETA_GAIN  = 0.3
 
 USE_ALL_USERS_PER_AP = False
 K_PER_AP = 4
@@ -64,23 +58,48 @@ FAIR_FRACTION = 0.25
 # ===================== RL: LIGAR / MODO =====================
 # ============================================================
 USE_RL = True
-RL_REWARD_MODE = "link"  # "link" (reward = link_quality normalizado)
+RL_REWARD_MODE = "cluster_link"  # "cluster_link" = reward combinado do cluster (0..1)
+LINK_QUALITY_GAMMA = 0.25        # mistura Q + link na seleção (por AP)
+
+# ============================================================
+# ============== COMBINAÇÃO DE LINK DO CLUSTER ===============
+# ============================================================
+# "max"  : max(lq_ap_ue) / 1
+# "sum"  : sum(lq_ap_ue) / NUM_AP
+# "mrc"  : sqrt(sum(lq^2)) / sqrt(NUM_AP)   (MRC-like)
+CLUSTER_COMBINE_MODE = "mrc"
+
+def combine_cluster_link(lq_list, mode="mrc", num_ap=16):
+    if len(lq_list) == 0:
+        return 0.0
+    lq = np.array(lq_list, dtype=np.float32)
+
+    if mode == "max":
+        comb = float(np.max(lq))               # já em [0,1]
+        return comb
+
+    if mode == "sum":
+        comb = float(np.sum(lq))               # em [0, len(lq)]
+        return comb / max(1.0, float(num_ap))  # normaliza p/ [0,1]
+
+    # default: "mrc"
+    comb = float(np.sqrt(np.sum(lq**2)))       # em [0, sqrt(len(lq))]
+    return comb / max(1e-9, float(np.sqrt(num_ap)))  # p/ [0,1]
 
 # ============================================================
 # ===================== BASELINE: SEM RL =====================
 # ============================================================
-# Se USE_RL=True, BASELINE_MODE não é usado (fica só para comparação)
-BASELINE_MODE = "channel"   # "random" | "linkfair" | "channel"
+BASELINE_MODE = "channel"  # "random" | "linkfair" | "channel"
+# (Se USE_RL=True, BASELINE_MODE não é usado.)
 
 # ============================================================
-# ============== “CELL-FREE” SEM PRÉ-FILTRO ==================
+# ============== “CELL-FREE” (APs x UEs) =====================
 # ============================================================
 ap_users = {ap: list(range(TOTAL_USERS)) for ap in range(NUM_AP)}
 
 PATHLOSS_EXP = 3.7
 MIN_DIST = 0.02
 SHADOWING_STD_DB = 6.0
-LINK_QUALITY_GAMMA = 0.25  # peso do link quando misturar com Q na seleção RL
 
 def generate_beta_matrix(num_ap, num_ue, area_side=1.0,
                          pathloss_exp=3.7, min_dist=0.02, shadow_std_db=6.0, seed=42):
@@ -109,6 +128,7 @@ beta_mk = generate_beta_matrix(
     seed=SEED
 )
 
+# link_quality[ap][u] em [0,1]
 link_quality = {ap: {} for ap in range(NUM_AP)}
 for ap in range(NUM_AP):
     ues = ap_users[ap]
@@ -212,8 +232,7 @@ class BanditSelector:
 class RLBanditSelector(BanditSelector):
     """
     Bandit com Q(ap, uid).
-    - update_q: média exponencial (lr = ALPHA_LEVEL)
-    - reward por link: reward = link_quality normalizado (0..1)
+    Aqui vamos atualizar Q usando reward do CLUSTER (0..1).
     """
     def __init__(self, ap_to_users):
         super().__init__(ap_to_users)
@@ -263,48 +282,37 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
         return users[:]
 
     # ---------------------------------------------------------
-    # (RL) seleção por Q(ap,uid) aprendida (reward = link)
-    # score = Q + gamma_link * link_quality  (opcional)
+    # (RL) seleção por Q(ap,uid) aprendida
+    # score = Q + gamma_link * link_quality(ap,uid)
     # ---------------------------------------------------------
     if USE_RL:
         if np.random.rand() < eps:
             return list(np.random.choice(users, size=K, replace=False))
 
-        # Q aprendido
-        q = np.array([bandit.get_q(ap, u) for u in users], dtype=np.float32)
-
-        # link atual (opcional: reforça estabilidade do canal mesmo no começo)
+        q  = np.array([bandit.get_q(ap, u) for u in users], dtype=np.float32)
         lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
-
         scores = q + gamma_link * lq
 
-        # desempate: menor nº de participações
         tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
         order = np.lexsort((tie, -scores))
         return [users[i] for i in order[:K]]
 
     # ---------------------------------------------------------
-    # (A) baseline aleatório puro
+    # baselines (se USE_RL=False)
     # ---------------------------------------------------------
     if BASELINE_MODE == "random":
         return list(np.random.choice(users, size=K, replace=False))
 
-    # ---------------------------------------------------------
-    # (B) baseline por canal (link_quality)
-    # ---------------------------------------------------------
     if BASELINE_MODE == "channel":
         if np.random.rand() < eps:
             return list(np.random.choice(users, size=K, replace=False))
 
         lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
         tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
-
         order = np.lexsort((tie, -lq))
         return [users[i] for i in order[:K]]
 
-    # ---------------------------------------------------------
-    # (C) modo antigo "linkfair"
-    # ---------------------------------------------------------
+    # linkfair (age + link)
     if np.random.rand() < eps:
         return list(np.random.choice(users, size=K, replace=False))
 
@@ -316,7 +324,6 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
         ages = ages / (float(np.max(ages)) + 1e-9)
 
     lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
-
     fairness_boost = 0.10
     scores = fairness_boost * ages + gamma_link * lq
 
@@ -337,43 +344,37 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
     return fair_candidates[:K]
 
 # ============================================================
-# === SELEÇÃO DISJUNTA (SEM UE REPETIDO EM VÁRIOS APs) ========
+# === NOVO: SELEÇÃO "CLUSTER" (UE PODE REPETIR EM VÁRIOS APs) =
 # ============================================================
-def select_disjoint_by_ap_round(bandit, round_idx, all_ues):
-    remaining = set(all_ues)
+def select_cluster_by_ap_round(bandit, round_idx, all_ues):
+    """
+    Cada AP seleciona seus K_PER_AP UEs (independente).
+    UE pode ser escolhido por múltiplos APs no mesmo round (cluster).
+    """
     selected_by_ap = {}
+    all_ues = list(all_ues)
 
     for ap in range(NUM_AP):
-        if not remaining:
-            selected_by_ap[ap] = []
-            continue
-
-        candidates_ap = sorted(remaining)
+        candidates_ap = all_ues[:]  # TODOS os UEs são candidatos p/ cada AP
 
         if USE_ALL_USERS_PER_AP:
-            ap_left = (NUM_AP - ap)
-            k_eff = int(math.ceil(len(candidates_ap) / ap_left))
+            chosen = candidates_ap
         else:
-            k_eff = min(K_PER_AP, len(candidates_ap))
-
-        chosen = select_topk_no_prefilter_baseline(
-            ap=ap,
-            bandit=bandit,
-            K=k_eff,
-            round_idx=round_idx,
-            candidates=candidates_ap,
-            link_q_dict=link_quality[ap],
-            temp=TEMP_SEL,
-            eps=EPS,
-            fair_fraction=FAIR_FRACTION,
-            gamma_link=LINK_QUALITY_GAMMA
-        )
+            chosen = select_topk_no_prefilter_baseline(
+                ap=ap,
+                bandit=bandit,
+                K=min(K_PER_AP, len(candidates_ap)),
+                round_idx=round_idx,
+                candidates=candidates_ap,
+                link_q_dict=link_quality[ap],
+                temp=TEMP_SEL,
+                eps=EPS,
+                fair_fraction=FAIR_FRACTION,
+                gamma_link=LINK_QUALITY_GAMMA
+            )
 
         chosen = list(dict.fromkeys(chosen))
         selected_by_ap[ap] = chosen
-
-        for uid in chosen:
-            remaining.discard(uid)
 
     return selected_by_ap
 
@@ -420,13 +421,16 @@ infer_flops = inference_flops_tf(global_model)
 train_flops_per_sample = train_flops_per_sample_from_infer(infer_flops)
 
 BYTES_PER_PARAM = 4
-BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM
+BYTES_PER_UE_PER_ROUND = 2 * n_params * BYTES_PER_PARAM  # down + up (UE<->servidor)
 
-print("\n===== CONFIG =====")
+print("\n===== CONFIG (CELL-FREE CLUSTER) =====")
 print(f"M (APs) = {NUM_AP}")
 print(f"K (UEs) = {TOTAL_USERS}")
 print(f"|D_j| (amostras por UE) = {SAMPLES_PER_USER}  (igual ao artigo)")
-print(f"USE_RL = {USE_RL} | RL_REWARD_MODE = {RL_REWARD_MODE} | BASELINE_MODE = {BASELINE_MODE} | K_PER_AP = {K_PER_AP}\n")
+print(f"K por AP = {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
+print(f"USE_RL = {USE_RL} | RL_REWARD_MODE = {RL_REWARD_MODE}")
+print(f"Cluster combine = {CLUSTER_COMBINE_MODE}")
+print("=====================================\n")
 
 print("===== MODELO =====")
 print(f"Parâmetros: {n_params:,}")
@@ -436,105 +440,136 @@ print(f"FLOPs/amostra (treino):  {pretty_num(train_flops_per_sample)}FLOPs (≈2
 val_ds  = tf.data.Dataset.from_tensor_slices((x_val,  y_val)).batch(BATCH_SIZE)
 test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(BATCH_SIZE)
 
-ue_participations = np.zeros(TOTAL_USERS, dtype=np.int32)
+# fairness: conta "rounds em que UE treinou" (UE único por rodada)
+ue_round_participations = np.zeros(TOTAL_USERS, dtype=np.int32)
+
+# só para estatística: quantas vezes apareceu em (AP,UE)
+ue_ap_instances = np.zeros(TOTAL_USERS, dtype=np.int32)
 
 total_flops_all_rounds = 0.0
 total_bytes_all_rounds = 0.0
-total_selected_updates = 0
+total_unique_ues_updates = 0
+total_ap_ue_instances = 0
 
 ALL_UES = list(range(TOTAL_USERS))
 
 for r in range(EPOCHS_GLOBAL):
     print(f"\n🔁 Rodada Federada {r+1}")
 
-    # seleção disjunta: cada UE no máximo 1 AP por rodada
-    selected_by_ap = select_disjoint_by_ap_round(bandit, r, ALL_UES)
+    # (1) cada AP escolhe seus UEs (cluster: UE pode repetir em vários APs)
+    selected_by_ap = select_cluster_by_ap_round(bandit, r, ALL_UES)
 
-    selected_union = sorted(set(u for uids in selected_by_ap.values() for u in uids))
+    # (2) monta cluster_map: para cada UE, quais APs o selecionaram
+    cluster_map = defaultdict(list)
+    for ap, uids in selected_by_ap.items():
+        for uid in uids:
+            cluster_map[uid].append(ap)
+
+    selected_union = sorted(cluster_map.keys())
     num_ues_unique_round = len(selected_union)
     total_selected_instances = sum(len(uids) for uids in selected_by_ap.values())
 
-    local_cache = {ap: {} for ap in range(NUM_AP)}
+    # estatística de cluster
+    cluster_sizes = [len(cluster_map[uid]) for uid in selected_union] if selected_union else [0]
+    avg_cluster = float(np.mean(cluster_sizes)) if len(cluster_sizes) else 0.0
 
-    for ap in range(NUM_AP):
-        for uid in selected_by_ap[ap]:
-            local_model = build_model(num_classes=10)
-            local_model.set_weights(global_model.get_weights())
+    # (3) treina CADA UE UMA VEZ (mesmo se aparecer em vários APs)
+    local_weights = {}
+    local_sizes = {}
 
-            x_u, y_u = user_data[uid]
-            local_model.fit(
-                x_u, y_u,
-                epochs=EPOCHS_LOCAL,
-                batch_size=BATCH_SIZE,
-                verbose=0,
-                shuffle=True
-            )
+    for uid in selected_union:
+        local_model = build_model(num_classes=10)
+        local_model.set_weights(global_model.get_weights())
 
-            local_cache[ap][uid] = (local_model.get_weights(), len(x_u))
-            ue_participations[uid] += 1
+        x_u, y_u = user_data[uid]
+        local_model.fit(
+            x_u, y_u,
+            epochs=EPOCHS_LOCAL,
+            batch_size=BATCH_SIZE,
+            verbose=0,
+            shuffle=True
+        )
 
-            # -------------------------------
-            # RL: reward por link (canal)
-            # -------------------------------
-            if USE_RL and RL_REWARD_MODE == "link":
-                reward = float(link_quality[ap].get(uid, 0.0))  # já está em [0,1]
-                bandit.update_q(ap, uid, reward, lr=ALPHA_LEVEL)
+        local_weights[uid] = local_model.get_weights()
+        local_sizes[uid] = len(x_u)
 
-    for ap in range(NUM_AP):
-        for uid in selected_by_ap[ap]:
+        # fairness por rodada (UE treinou neste round)
+        ue_round_participations[uid] += 1
+
+        # conta instâncias AP×UE (estatística)
+        ue_ap_instances[uid] += len(cluster_map[uid])
+
+        # (4) reward do RL = link combinado do cluster
+        if USE_RL and RL_REWARD_MODE == "cluster_link":
+            lqs = [float(link_quality[ap].get(uid, 0.0)) for ap in cluster_map[uid]]
+            reward_cluster = combine_cluster_link(
+                lq_list=lqs,
+                mode=CLUSTER_COMBINE_MODE,
+                num_ap=NUM_AP
+            )  # em [0,1]
+
+            # atualiza Q(ap,uid) para TODOS os APs que serviram esse UE
+            for ap in cluster_map[uid]:
+                bandit.update_q(ap, uid, reward_cluster, lr=ALPHA_LEVEL)
+
+    # marca participações (AP,UE) para desempate/fairness por AP
+    for ap, uids in selected_by_ap.items():
+        for uid in uids:
             bandit.mark_participation(ap, uid, r)
 
-    ap_models_weights = []
-    ap_sizes = []
-    for ap in range(NUM_AP):
-        uids = selected_by_ap[ap]
-        if len(uids) == 0:
-            ap_models_weights.append(global_model.get_weights())
-            ap_sizes.append(0.0)
-            continue
+    # (5) agregação GLOBAL (FedAvg clássico) sobre UEs únicos do round
+    weights_list = [local_weights[uid] for uid in selected_union]
+    sizes_list   = [local_sizes[uid]   for uid in selected_union]
 
-        weights_list = [local_cache[ap][uid][0] for uid in uids]
-        sizes = [local_cache[ap][uid][1] for uid in uids]
-
-        ap_w = fedavg(weights_list, sizes)
-        ap_models_weights.append(ap_w)
-        ap_sizes.append(float(np.sum(sizes)))
-
-    new_global_weights = fedavg(ap_models_weights, ap_sizes)
+    new_global_weights = fedavg(weights_list, sizes_list)
     if new_global_weights is not None:
         global_model.set_weights(new_global_weights)
 
-    flops_this_round = train_flops_per_sample * SAMPLES_PER_USER * EPOCHS_LOCAL * total_selected_instances
-    bytes_this_round = BYTES_PER_UE_PER_ROUND * total_selected_instances
+    # (6) custo (agora baseado em UEs únicos que realmente treinaram)
+    flops_this_round = train_flops_per_sample * SAMPLES_PER_USER * EPOCHS_LOCAL * num_ues_unique_round
+    bytes_this_round = BYTES_PER_UE_PER_ROUND * num_ues_unique_round
 
     total_flops_all_rounds += flops_this_round
     total_bytes_all_rounds += bytes_this_round
-    total_selected_updates += total_selected_instances
+    total_unique_ues_updates += num_ues_unique_round
+    total_ap_ue_instances += total_selected_instances
 
     _, acc_r = global_model.evaluate(test_ds, verbose=0)
-    print(f"   ↳ UEs únicos: {num_ues_unique_round} | treinos (AP,UE): {total_selected_instances} | acc={acc_r*100:.2f}%")
-    print(f"   ↳ FLOPs: {pretty_num(flops_this_round)} | Bytes (↓↑): {bytes_this_round/1e6:.2f} MB")
+    print(f"   ↳ UEs únicos: {num_ues_unique_round} | instâncias (AP,UE): {total_selected_instances} | cluster médio={avg_cluster:.2f}")
+    print(f"   ↳ acc={acc_r*100:.2f}% | FLOPs: {pretty_num(flops_this_round)} | Bytes (↓↑): {bytes_this_round/1e6:.2f} MB")
 
 loss, acc = global_model.evaluate(test_ds, verbose=0)
 print(f"\n🎯 Acurácia final do modelo global: {acc * 100:.2f}%")
 
 print("\n==================== RELATÓRIO FINAL ====================")
 print(f"APs (M):                         {NUM_AP}")
-print(f"UEs totais (K):                  {TOTAL_USERS}  (K ∈ {{20,40}})")
+print(f"UEs totais (K):                  {TOTAL_USERS}")
 print(f"|D_j| (amostras por UE):          {SAMPLES_PER_USER}  (igual ao artigo)")
-print(f"K selecionados por AP:           {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
+print(f"K por AP:                        {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
 print(f"USE_RL:                          {USE_RL} (RL_REWARD_MODE={RL_REWARD_MODE})")
+print(f"Cluster combine:                 {CLUSTER_COMBINE_MODE}")
 print(f"Parâmetros do modelo:            {n_params:,}")
 print(f"FLOPs/amostra (forward):         {pretty_num(infer_flops)}FLOPs")
 print(f"FLOPs/amostra (treino):          {pretty_num(train_flops_per_sample)}FLOPs (≈2.5×)")
-print(f"Total de treinos (AP,UE) somados:{total_selected_updates}")
+print(f"Total UEs únicos treinados:      {total_unique_ues_updates}")
+print(f"Total instâncias (AP,UE):        {total_ap_ue_instances}")
 print(f"FLOPs totais (treino local):     {pretty_num(total_flops_all_rounds)}FLOPs")
 print(f"Bytes totais (↓↑, float32):      {total_bytes_all_rounds/1e6:.2f} MB")
 print("=========================================================\n")
 
-jain_part = jain_index(ue_participations)
-print("==================== FAIRNESS DE PARTICIPAÇÃO (POR UE) ====================")
-print(f"Participações (treinos) mín / máx:     {ue_participations.min():.0f} / {ue_participations.max():.0f}")
-print(f"Média / desvio padrão:                {ue_participations.mean():.2f} / {ue_participations.std():.2f}")
-print(f"Índice de Jain (treinos por UE):       {jain_part:.4f}")
-print("============================================================================\n")
+# fairness por "rounds que o UE participou"
+jain_round = jain_index(ue_round_participations)
+
+print("=========== FAIRNESS (UEs ÚNICOS POR RODADA) ===========")
+print(f"Participações (rounds) mín / máx: {ue_round_participations.min():.0f} / {ue_round_participations.max():.0f}")
+print(f"Média / desvio padrão:           {ue_round_participations.mean():.2f} / {ue_round_participations.std():.2f}")
+print(f"Índice de Jain (rounds por UE):  {jain_round:.4f}")
+print("========================================================\n")
+
+# só para você enxergar o quanto repetiu em APs
+jain_inst = jain_index(ue_ap_instances)
+print("=========== ESTATÍSTICA (INSTÂNCIAS AP×UE) ============")
+print(f"Instâncias (AP,UE) mín / máx:     {ue_ap_instances.min():.0f} / {ue_ap_instances.max():.0f}")
+print(f"Média / desvio padrão:            {ue_ap_instances.mean():.2f} / {ue_ap_instances.std():.2f}")
+print(f"Índice de Jain (instâncias):      {jain_inst:.4f}")
+print("======================================================\n")
