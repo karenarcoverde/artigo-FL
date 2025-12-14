@@ -61,9 +61,15 @@ TEMP_SEL = 0.8
 FAIR_FRACTION = 0.25
 
 # ============================================================
+# ===================== RL: LIGAR / MODO =====================
+# ============================================================
+USE_RL = True
+RL_REWARD_MODE = "link"  # "link" (reward = link_quality normalizado)
+
+# ============================================================
 # ===================== BASELINE: SEM RL =====================
 # ============================================================
-USE_RL = False
+# Se USE_RL=True, BASELINE_MODE não é usado (fica só para comparação)
 BASELINE_MODE = "channel"   # "random" | "linkfair" | "channel"
 
 # ============================================================
@@ -74,7 +80,7 @@ ap_users = {ap: list(range(TOTAL_USERS)) for ap in range(NUM_AP)}
 PATHLOSS_EXP = 3.7
 MIN_DIST = 0.02
 SHADOWING_STD_DB = 6.0
-LINK_QUALITY_GAMMA = 0.25
+LINK_QUALITY_GAMMA = 0.25  # peso do link quando misturar com Q na seleção RL
 
 def generate_beta_matrix(num_ap, num_ue, area_side=1.0,
                          pathloss_exp=3.7, min_dist=0.02, shadow_std_db=6.0, seed=42):
@@ -188,7 +194,7 @@ def build_model(num_classes=10):
     return model
 
 # ============================================================
-# ===================== “BANDIT” (SEM APRENDER Q) ============
+# ===================== “BANDIT” BASE ========================
 # ============================================================
 class BanditSelector:
     def __init__(self, ap_to_users):
@@ -199,6 +205,26 @@ class BanditSelector:
     def mark_participation(self, ap, uid, round_idx):
         self.n[ap][uid] += 1
         self.last_round[ap][uid] = round_idx
+
+# ============================================================
+# ===================== RL (BANDIT COM Q) ====================
+# ============================================================
+class RLBanditSelector(BanditSelector):
+    """
+    Bandit com Q(ap, uid).
+    - update_q: média exponencial (lr = ALPHA_LEVEL)
+    - reward por link: reward = link_quality normalizado (0..1)
+    """
+    def __init__(self, ap_to_users):
+        super().__init__(ap_to_users)
+        self.Q = defaultdict(lambda: defaultdict(float))
+
+    def update_q(self, ap, uid, reward, lr=ALPHA_LEVEL):
+        q_old = self.Q[ap][uid]
+        self.Q[ap][uid] = (1.0 - lr) * q_old + lr * float(reward)
+
+    def get_q(self, ap, uid):
+        return float(self.Q[ap][uid])
 
 # ============================================================
 # ===================== FEDAVG ===============================
@@ -237,23 +263,42 @@ def select_topk_no_prefilter_baseline(ap, bandit, K, round_idx,
         return users[:]
 
     # ---------------------------------------------------------
+    # (RL) seleção por Q(ap,uid) aprendida (reward = link)
+    # score = Q + gamma_link * link_quality  (opcional)
+    # ---------------------------------------------------------
+    if USE_RL:
+        if np.random.rand() < eps:
+            return list(np.random.choice(users, size=K, replace=False))
+
+        # Q aprendido
+        q = np.array([bandit.get_q(ap, u) for u in users], dtype=np.float32)
+
+        # link atual (opcional: reforça estabilidade do canal mesmo no começo)
+        lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
+
+        scores = q + gamma_link * lq
+
+        # desempate: menor nº de participações
+        tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
+        order = np.lexsort((tie, -scores))
+        return [users[i] for i in order[:K]]
+
+    # ---------------------------------------------------------
     # (A) baseline aleatório puro
     # ---------------------------------------------------------
     if BASELINE_MODE == "random":
         return list(np.random.choice(users, size=K, replace=False))
 
     # ---------------------------------------------------------
-    # (B) baseline por canal (link_quality)  <<< VOCÊ QUER ISSO
+    # (B) baseline por canal (link_quality)
     # ---------------------------------------------------------
     if BASELINE_MODE == "channel":
-        # exploração opcional
         if np.random.rand() < eps:
             return list(np.random.choice(users, size=K, replace=False))
 
         lq = np.array([link_q_dict.get(u, 0.0) for u in users], dtype=np.float32)
         tie = np.array([bandit.n[ap][u] for u in users], dtype=np.int32)
 
-        # maior canal primeiro; empate -> menor nº participações
         order = np.lexsort((tie, -lq))
         return [users[i] for i in order[:K]]
 
@@ -367,7 +412,7 @@ def pretty_num(x):
 # ============================================================
 # ===================== LOOP FEDERADO ========================
 # ============================================================
-bandit = BanditSelector(ap_users)
+bandit = RLBanditSelector(ap_users) if USE_RL else BanditSelector(ap_users)
 global_model = build_model(num_classes=10)
 
 n_params = count_params(global_model)
@@ -381,7 +426,7 @@ print("\n===== CONFIG =====")
 print(f"M (APs) = {NUM_AP}")
 print(f"K (UEs) = {TOTAL_USERS}")
 print(f"|D_j| (amostras por UE) = {SAMPLES_PER_USER}  (igual ao artigo)")
-print(f"USE_RL = {USE_RL} | BASELINE_MODE = {BASELINE_MODE} | K_PER_AP = {K_PER_AP}\n")
+print(f"USE_RL = {USE_RL} | RL_REWARD_MODE = {RL_REWARD_MODE} | BASELINE_MODE = {BASELINE_MODE} | K_PER_AP = {K_PER_AP}\n")
 
 print("===== MODELO =====")
 print(f"Parâmetros: {n_params:,}")
@@ -428,6 +473,13 @@ for r in range(EPOCHS_GLOBAL):
             local_cache[ap][uid] = (local_model.get_weights(), len(x_u))
             ue_participations[uid] += 1
 
+            # -------------------------------
+            # RL: reward por link (canal)
+            # -------------------------------
+            if USE_RL and RL_REWARD_MODE == "link":
+                reward = float(link_quality[ap].get(uid, 0.0))  # já está em [0,1]
+                bandit.update_q(ap, uid, reward, lr=ALPHA_LEVEL)
+
     for ap in range(NUM_AP):
         for uid in selected_by_ap[ap]:
             bandit.mark_participation(ap, uid, r)
@@ -471,7 +523,7 @@ print(f"APs (M):                         {NUM_AP}")
 print(f"UEs totais (K):                  {TOTAL_USERS}  (K ∈ {{20,40}})")
 print(f"|D_j| (amostras por UE):          {SAMPLES_PER_USER}  (igual ao artigo)")
 print(f"K selecionados por AP:           {'ALL' if USE_ALL_USERS_PER_AP else K_PER_AP}")
-print(f"USE_RL:                          {USE_RL} (baseline={BASELINE_MODE})")
+print(f"USE_RL:                          {USE_RL} (RL_REWARD_MODE={RL_REWARD_MODE})")
 print(f"Parâmetros do modelo:            {n_params:,}")
 print(f"FLOPs/amostra (forward):         {pretty_num(infer_flops)}FLOPs")
 print(f"FLOPs/amostra (treino):          {pretty_num(train_flops_per_sample)}FLOPs (≈2.5×)")
