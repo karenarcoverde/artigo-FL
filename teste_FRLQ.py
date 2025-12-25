@@ -1,22 +1,22 @@
 # frl_qgradual_cellfree.py
 # ============================================================
-# FRL-QGradual (DQN-FedGradual) no contexto Cell-Free (toy env)
-# APs = agentes, CPU = servidor federado
+# Comparação (toy Cell-Free):
+#   (A) FRL-QGradual / FRL-FedAvg:
+#       - Cada AP treina um DQN localmente
+#       - Uplink AP->CPU: DELTA de parâmetros (float32) SOMENTE a cada comm_period rounds
+#         (sem top-k / sem quantização)
 #
-# Modos:
-#   --algo qgradual : FRL-QGradual (DQN local + w_t gradual)
-#   --algo fedavg   : FRL-FedAvg   (DQN local + w_t=1)
-#   --algo fl       : FL puro (supervisionado + FedAvg), sem RL/TD
+#   (B) "FL clássico com dados brutos" (fl_raw):
+#       - APs NÃO treinam (só executam a política global + epsilon-greedy)
+#       - Uplink AP->CPU: TRANSIÇÕES brutas (s,a,r,s2,done)
+#       - CPU treina um DQN centralizado
 #
-# Comunicação (uplink AP->CPU):
-#   --comm_mode none        : envia delta full float32 (baseline)
-#   --comm_mode topk_quant  : envia delta esparso top-k + quantização (bits menores)
-#   --upload_thresh > 0     : se ||delta||_2 < thresh -> não envia nada (0 bits)
-#
-# Métricas principais:
-#   - rounds_to_target (via reward MA)
-#   - total_uplink_bits_to_target (bits até convergir)
-#   - total_uplink_bits (bits no horizonte total)
+# Métricas:
+#   - rounds_to_target (reward moving-average >= target_reward)
+#   - uplink_total_bits_to_target
+#   - uplink_total_bits
+#   - env_steps_to_target, env_steps_total
+#   - auc(reward_ma), last_reward_ma
 #
 # Dependências: numpy, torch
 # ============================================================
@@ -25,7 +25,7 @@ import argparse
 import math
 import random
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import torch
@@ -84,7 +84,7 @@ class ReplayBuffer:
 # Q-Network
 # -------------------------
 class QNetwork(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int, hidden: int = 128):
+    def __init__(self, obs_dim: int, n_actions: int, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden),
@@ -96,19 +96,6 @@ class QNetwork(nn.Module):
 
     def forward(self, x):
         return self.net(x)
-
-
-# -------------------------
-# Teacher para FL puro
-# -------------------------
-def teacher_action_beta_queue(
-    obs: np.ndarray, K: int, n_powers: int, power_idx_fixed: int = 1
-) -> int:
-    beta = obs[:K]
-    q = obs[K:2 * K] + 1e-3
-    score = beta / q
-    ue = int(np.argmax(score))
-    return ue * n_powers + int(power_idx_fixed)
 
 
 # -------------------------
@@ -215,15 +202,15 @@ class CellFreeToyEnv:
 
         self.t += 1
         done = (self.t >= cfg.episode_len)
+
         self._sample_channels()
         obs_next = self._get_obs_all()
-
         info = {"sum_rate": float(rate.sum()), "avg_queue": float(self.queues.mean())}
         return obs_next, rewards.tolist(), done, info
 
 
 # -------------------------
-# DQN Agent (FRL)
+# Config DQN
 # -------------------------
 @dataclass
 class DQNConfig:
@@ -231,25 +218,37 @@ class DQNConfig:
     lr: float = 5e-4
     batch_size: int = 64
     buffer_size: int = 50000
-    start_learn: int = 200          # <<-- mais rápido que 1000
+    start_learn: int = 200
     train_freq: int = 1
     target_update: int = 200
     eps_start: float = 1.0
     eps_end: float = 0.05
-    eps_decay_steps: int = 8000     # <<-- mais rápido que 20000
+    eps_decay_steps: int = 8000
     grad_clip_norm: float = 10.0
 
 
+# -------------------------
+# FRL: agente DQN local (treina local)
+# -------------------------
 class DQNAgent:
-    def __init__(self, obs_dim: int, n_actions: int, cfg: DQNConfig, device: torch.device, seed: int):
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        hidden: int,
+        cfg: DQNConfig,
+        device: torch.device,
+        seed: int,
+    ):
         self.obs_dim = obs_dim
         self.n_actions = n_actions
+        self.hidden = hidden
         self.cfg = cfg
         self.device = device
         self.rng = np.random.default_rng(seed)
 
-        self.q = QNetwork(obs_dim, n_actions).to(device)
-        self.q_tgt = QNetwork(obs_dim, n_actions).to(device)
+        self.q = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
+        self.q_tgt = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
         self.q_tgt.load_state_dict(self.q.state_dict())
 
         self.opt = optim.Adam(self.q.parameters(), lr=cfg.lr)
@@ -311,53 +310,71 @@ class DQNAgent:
 
 
 # -------------------------
-# FL Agent (supervisionado)
+# "FL clássico com dados brutos": AP é coletor (não treina)
 # -------------------------
-class FLAgent:
-    def __init__(self, obs_dim: int, n_actions: int, lr: float, device: torch.device, seed: int):
+class CollectorAgent:
+    """
+    Coleta transições e faz uplink de dados brutos (s,a,r,s2,done).
+    Não treina localmente; só executa a política global (broadcast) + epsilon-greedy.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        hidden: int,
+        cfg: DQNConfig,
+        device: torch.device,
+        seed: int,
+    ):
         self.obs_dim = obs_dim
         self.n_actions = n_actions
+        self.hidden = hidden
+        self.cfg = cfg
         self.device = device
         self.rng = np.random.default_rng(seed)
 
-        self.model = QNetwork(obs_dim, n_actions).to(device)
-        self.opt = optim.Adam(self.model.parameters(), lr=lr)
+        self.q = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
+        self.total_steps = 0
+        self.transitions = []  # lista de (s,a,r,s2,done)
+
+    def epsilon(self):
+        cfg = self.cfg
+        t = min(self.total_steps, cfg.eps_decay_steps)
+        eps = cfg.eps_start + (cfg.eps_end - cfg.eps_start) * (t / cfg.eps_decay_steps)
+        return float(eps)
 
     @torch.no_grad()
-    def act(self, obs: np.ndarray) -> int:
+    def act(self, obs: np.ndarray):
+        eps = self.epsilon()
+        self.total_steps += 1
+        if self.rng.random() < eps:
+            return int(self.rng.integers(0, self.n_actions))
         x = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        logits = self.model(x)
-        return int(torch.argmax(logits, dim=1).item())
+        qvals = self.q(x)
+        return int(torch.argmax(qvals, dim=1).item())
 
-    def train_supervised_batch(self, obs_batch: np.ndarray, a_batch: np.ndarray) -> float:
-        x = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
-        y = torch.tensor(a_batch, dtype=torch.int64, device=self.device)
+    def store_transition(self, s, a, r, s2, done):
+        self.transitions.append((s, a, r, s2, done))
 
-        logits = self.model(x)
-        loss = nn.functional.cross_entropy(logits, y)
-
-        self.opt.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.model.parameters(), 10.0)
-        self.opt.step()
-        return float(loss.item())
-
-    def get_param_vector(self) -> torch.Tensor:
-        return parameters_to_vector(self.model.parameters()).detach().clone()
+    def pop_all_transitions(self):
+        out = self.transitions
+        self.transitions = []
+        return out
 
     def set_param_vector(self, vec: torch.Tensor):
-        vector_to_parameters(vec.detach().clone(), self.model.parameters())
+        vector_to_parameters(vec.detach().clone(), self.q.parameters())
 
 
 # -------------------------
-# Servidor Federado (CPU)
+# Servidor federado (FRL): agrega deltas com wt (QGradual) ou wt=1 (FedAvg)
 # -------------------------
 @dataclass
 class FedConfig:
     rounds: int = 200
-    local_episodes_per_round: int = 2     # <<-- mais local update por round (acelera FRL)
+    local_episodes_per_round: int = 2
     delta_rounds: int = 60
-    warmup_rounds: int = 30              # <<-- impede wt>1 no início (estabiliza)
+    warmup_rounds: int = 30
     vmin: float = -100.0
     vmax: float = 100.0
 
@@ -372,14 +389,13 @@ class FedServer:
         self.w0 = float(math.log(n_agents) + 1.0)
 
     def weight_wt(self, t_round: int) -> float:
-        # warmup: durante as primeiras rodadas, wt=1 pra não amplificar ruído
+        # warmup: durante as primeiras rodadas, wt=1 (estabiliza)
         if t_round < int(self.fedcfg.warmup_rounds):
             return 1.0
         if self.algo == "fedavg":
             return 1.0
 
         delta = max(1, int(self.fedcfg.delta_rounds))
-        # t_round aqui é absoluto; vamos mapear para "tempo após warmup"
         tw = t_round - int(self.fedcfg.warmup_rounds)
         if 0 < tw < delta:
             return self.w0 - (tw * (self.w0 - 1.0) / delta)
@@ -395,53 +411,71 @@ class FedServer:
 
 
 # -------------------------
-# Comunicação: top-k + quantização + gatilho
+# Servidor central (fl_raw): treina DQN global com transições brutas recebidas
 # -------------------------
-def compress_delta_topk_quant(
-    delta: torch.Tensor,
-    topk_frac: float,
-    quant_bits: int,
-    upload_thresh: float,
-) -> Tuple[torch.Tensor, int]:
-    """
-    Retorna:
-      delta_hat (reconstruído no servidor) e bits_uplink (aproximado)
-    """
-    assert 1 <= quant_bits <= 16
-    N = delta.numel()
+class CentralDQNServer:
+    def __init__(
+        self,
+        obs_dim: int,
+        n_actions: int,
+        hidden: int,
+        cfg: DQNConfig,
+        device: torch.device,
+        seed: int,
+    ):
+        self.obs_dim = obs_dim
+        self.n_actions = n_actions
+        self.hidden = hidden
+        self.cfg = cfg
+        self.device = device
+        self.rng = np.random.default_rng(seed)
 
-    # gatilho: não envia nada se delta pequeno
-    if upload_thresh > 0.0:
-        if float(torch.norm(delta).item()) < upload_thresh:
-            return torch.zeros_like(delta), 0
+        self.q = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
+        self.q_tgt = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
+        self.q_tgt.load_state_dict(self.q.state_dict())
 
-    # top-k
-    k = max(1, int(math.ceil(topk_frac * N)))
-    vals, idx = torch.topk(delta.abs(), k, largest=True, sorted=False)
-    top_idx = idx
-    top_val = delta[top_idx]
+        self.opt = optim.Adam(self.q.parameters(), lr=cfg.lr)
+        self.rb = ReplayBuffer(cfg.buffer_size, obs_dim, device)
+        self.total_steps = 0
 
-    # quantização uniforme simétrica nos top-k
-    # usa scale = max(|v|)
-    vmax = float(top_val.abs().max().item()) + 1e-12
-    qmax = (2 ** (quant_bits - 1)) - 1  # signed
-    scale = vmax / qmax
+    def get_param_vector(self) -> torch.Tensor:
+        return parameters_to_vector(self.q.parameters()).detach().clone()
 
-    q = torch.clamp(torch.round(top_val / scale), -qmax, qmax).to(torch.int16)
-    deq = (q.to(delta.dtype) * scale)
+    def ingest_transitions(self, transitions: List[tuple]):
+        for (s, a, r, s2, done) in transitions:
+            self.rb.add(s, a, r, s2, done)
 
-    # reconstrói delta_hat esparso
-    delta_hat = torch.zeros_like(delta)
-    delta_hat[top_idx] = deq
+    def train_steps(self, n_steps: int) -> float:
+        cfg = self.cfg
+        if self.rb.size < cfg.start_learn:
+            return 0.0
 
-    # bits: índices + valores + scale
-    # - índice: ceil(log2(N)) bits cada
-    # - valor quant: quant_bits bits cada
-    # - scale: 32 bits (float32) por update
-    bits_idx = int(math.ceil(math.log2(N))) if N > 1 else 1
-    bits = k * (bits_idx + quant_bits) + 32
+        losses = []
+        for _ in range(n_steps):
+            self.total_steps += 1
+            if (self.total_steps % cfg.train_freq) != 0:
+                continue
 
-    return delta_hat, int(bits)
+            s, a, r, s2, d = self.rb.sample(cfg.batch_size)
+
+            with torch.no_grad():
+                next_a = torch.argmax(self.q(s2), dim=1, keepdim=True)
+                next_q = self.q_tgt(s2).gather(1, next_a)
+                y = r + cfg.gamma * (1.0 - d) * next_q
+
+            qsa = self.q(s).gather(1, a)
+            loss = nn.functional.smooth_l1_loss(qsa, y)
+
+            self.opt.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.q.parameters(), cfg.grad_clip_norm)
+            self.opt.step()
+            losses.append(float(loss.item()))
+
+            if (self.total_steps % cfg.target_update) == 0:
+                self.q_tgt.load_state_dict(self.q.state_dict())
+
+        return float(np.mean(losses)) if losses else 0.0
 
 
 # -------------------------
@@ -467,6 +501,26 @@ def auc(y: List[float]) -> float:
 
 
 # -------------------------
+# Contagem de bits (uplink AP->CPU)
+# -------------------------
+def bits_delta_params_float32(n_params: int) -> int:
+    return int(n_params) * 32
+
+
+def bits_raw_transition(obs_dim: int) -> int:
+    """
+    Transição bruta: (s, a, r, s2, done)
+      s   : obs_dim float32
+      s2  : obs_dim float32
+      a   : int32  (32 bits)
+      r   : float32
+      done: int32  (32 bits)
+    Total bits = (2*obs_dim + 3) * 32
+    """
+    return (2 * int(obs_dim) + 3) * 32
+
+
+# -------------------------
 # Loop principal
 # -------------------------
 def run_experiment(
@@ -476,151 +530,237 @@ def run_experiment(
     dqn_cfg: DQNConfig,
     fed_cfg: FedConfig,
     device: torch.device,
+    hidden: int,
+    comm_period: int,
     target_reward: float,
     ma_window: int,
-    comm_mode: str,
-    topk_frac: float,
-    quant_bits: int,
-    upload_thresh: float,
-):
+    server_train_steps_per_round: int,
+    log_every: int = 20,
+) -> Dict:
+    """
+    algo:
+      - "qgradual": FRL-QGradual (uplink = delta parâmetros, comm_period)
+      - "fedavg"  : FRL-FedAvg   (uplink = delta parâmetros, comm_period)
+      - "fl_raw"  : "FL clássico" com dados brutos (uplink = transições)
+    """
     set_seeds(seed)
     env = CellFreeToyEnv(env_cfg, seed=seed)
 
-    # cria agentes
-    agents = []
-    if algo == "fl":
-        for l in range(env_cfg.L):
-            agents.append(FLAgent(env.obs_dim, env.n_actions, lr=dqn_cfg.lr, device=device, seed=seed + 1000 + l))
-    else:
-        for l in range(env_cfg.L):
-            agents.append(DQNAgent(env.obs_dim, env.n_actions, dqn_cfg, device, seed=seed + 1000 + l))
-
-    # servidor
-    theta0 = agents[0].get_param_vector()
-    server_algo = "fedavg" if algo == "fl" else algo
-    server = FedServer(theta0, n_agents=env_cfg.L, fedcfg=fed_cfg, algo=server_algo)
-
-    for ag in agents:
-        ag.set_param_vector(server.theta)
-
-    # métricas
     round_rewards_mean: List[float] = []
-    round_wt: List[float] = []
     total_uplink_bits = 0
     total_uplink_bits_to_target: Optional[int] = None
     rounds_to_target: Optional[int] = None
 
-    for t_round in range(fed_cfg.rounds):
-        # broadcast
+    env_steps_total = 0
+    env_steps_to_target: Optional[int] = None
+
+    if algo in ("qgradual", "fedavg"):
+        # ---------------- FRL ----------------
+        agents = [
+            DQNAgent(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 1000 + l)
+            for l in range(env_cfg.L)
+        ]
+        theta0 = agents[0].get_param_vector()
+        server = FedServer(theta0, n_agents=env_cfg.L, fedcfg=fed_cfg, algo=algo)
+
         for ag in agents:
             ag.set_param_vector(server.theta)
 
-        obs_all = env.reset()
-        local_round_rewards = []
+        n_params = int(server.theta.numel())
+        comm_period = max(1, int(comm_period))
 
-        # local episodes
-        for _ in range(fed_cfg.local_episodes_per_round):
-            done = False
-            while not done:
-                actions = [agents[l].act(obs_all[l]) for l in range(env_cfg.L)]
-                obs2_all, rewards_all, done, _info = env.step(actions)
+        for t_round in range(fed_cfg.rounds):
+            # broadcast CPU->AP (não contamos)
+            for ag in agents:
+                ag.set_param_vector(server.theta)
 
-                if algo == "fl":
-                    # treino supervisionado
-                    n_powers = len(env_cfg.power_levels)
-                    K = env_cfg.K
-                    labels = [
-                        teacher_action_beta_queue(obs_all[l], K=K, n_powers=n_powers, power_idx_fixed=1)
-                        for l in range(env_cfg.L)
-                    ]
-                    for l in range(env_cfg.L):
-                        agents[l].train_supervised_batch(
-                            obs_batch=np.asarray([obs_all[l]], dtype=np.float32),
-                            a_batch=np.asarray([labels[l]], dtype=np.int64),
-                        )
-                else:
-                    # treino DQN
+            obs_all = env.reset()
+            local_round_rewards = []
+
+            # local episodes: AP treina DQN local
+            for _ in range(fed_cfg.local_episodes_per_round):
+                done = False
+                while not done:
+                    actions = [agents[l].act(obs_all[l]) for l in range(env_cfg.L)]
+                    obs2_all, rewards_all, done, _info = env.step(actions)
+
                     for l in range(env_cfg.L):
                         agents[l].store(obs_all[l], actions[l], rewards_all[l], obs2_all[l], done)
                         agents[l].maybe_train()
 
-                obs_all = obs2_all
-                local_round_rewards.append(float(np.mean(rewards_all)))
+                    obs_all = obs2_all
+                    local_round_rewards.append(float(np.mean(rewards_all)))
 
-        # deltas + comunicação
-        deltas_to_server = []
-        bits_this_round = 0
+                    # conta env steps (um step do ambiente por tempo, independente de L)
+                    env_steps_total += 1
 
-        for ag in agents:
-            theta_k = ag.get_param_vector()
-            delta = theta_k - server.theta
+            # uplink: deltas SOMENTE quando do_comm=True
+            do_comm = ((t_round % comm_period) == 0)
+            deltas_to_server = []
+            bits_this_round = 0
 
-            if algo == "fl":
-                # baseline FL: envia full float32
-                # bits = N * 32
-                bits_this_round += int(delta.numel()) * 32
-                deltas_to_server.append(delta)
-            else:
-                if comm_mode == "none":
-                    bits_this_round += int(delta.numel()) * 32
+            if do_comm:
+                for ag in agents:
+                    theta_k = ag.get_param_vector()
+                    delta = theta_k - server.theta
                     deltas_to_server.append(delta)
-                elif comm_mode == "topk_quant":
-                    delta_hat, bits = compress_delta_topk_quant(
-                        delta=delta,
-                        topk_frac=topk_frac,
-                        quant_bits=quant_bits,
-                        upload_thresh=upload_thresh,
-                    )
-                    bits_this_round += bits
-                    deltas_to_server.append(delta_hat)
-                else:
-                    raise ValueError("comm_mode inválido")
+                    bits_this_round += bits_delta_params_float32(n_params)
 
-        total_uplink_bits += bits_this_round
+                total_uplink_bits += bits_this_round
+                server.aggregate(deltas_to_server, t_round=t_round)
+            else:
+                # sem comunicação: nada enviado, modelo global não muda
+                bits_this_round = 0
 
-        # agrega
-        wt = server.weight_wt(t_round)
-        server.aggregate(deltas_to_server, t_round=t_round)
-        round_wt.append(float(wt))
+            rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
+            round_rewards_mean.append(rr)
 
-        # reward
-        rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
-        round_rewards_mean.append(rr)
+            rewards_ma = moving_average(round_rewards_mean, ma_window)
+            r_ma = rewards_ma[-1] if rewards_ma else 0.0
 
-        # convergência
-        r_ma = moving_average(round_rewards_mean, ma_window)[-1]
-        if rounds_to_target is None and r_ma >= target_reward:
-            rounds_to_target = t_round + 1
-            total_uplink_bits_to_target = total_uplink_bits
+            if rounds_to_target is None and r_ma >= target_reward:
+                rounds_to_target = t_round + 1
+                total_uplink_bits_to_target = total_uplink_bits
+                env_steps_to_target = env_steps_total
 
-        if (t_round + 1) % 20 == 0:
-            print(
-                f"[{algo}] round {t_round+1:04d}/{fed_cfg.rounds} "
-                f"wt={wt:.3f} reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
-                f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
-                f"uplink_total={total_uplink_bits/1e6:.1f} Mbits"
-            )
+            if log_every > 0 and ((t_round + 1) % log_every == 0):
+                wt = server.weight_wt(t_round)
+                print(
+                    f"[{algo}] round {t_round+1:04d}/{fed_cfg.rounds} "
+                    f"comm={'Y' if do_comm else 'N'} wt={wt:.3f} "
+                    f"reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
+                    f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
+                    f"uplink_total={total_uplink_bits/1e6:.3f} Mbits"
+                )
 
-    rewards_ma = moving_average(round_rewards_mean, ma_window)
-    return {
-        "algo_client": algo,
-        "algo_server": server_algo,
-        "comm_mode": comm_mode,
-        "topk_frac": topk_frac,
-        "quant_bits": quant_bits,
-        "upload_thresh": upload_thresh,
-        "rounds": fed_cfg.rounds,
-        "uplink_total_bits": int(total_uplink_bits),
-        "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
-        "rounds_to_target": rounds_to_target,
-        "auc_rewards_ma": auc(rewards_ma),
-        "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
-    }
+        rewards_ma = moving_average(round_rewards_mean, ma_window)
+        return {
+            "algo": algo,
+            "rounds": fed_cfg.rounds,
+            "hidden": hidden,
+            "comm_period": comm_period,
+            "uplink_total_bits": int(total_uplink_bits),
+            "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
+            "rounds_to_target": rounds_to_target,
+            "env_steps_total": int(env_steps_total),
+            "env_steps_to_target": None if env_steps_to_target is None else int(env_steps_to_target),
+            "auc_rewards_ma": auc(rewards_ma),
+            "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
+        }
+
+    elif algo == "fl_raw":
+        # ---------------- FL RAW (dados brutos) ----------------
+        server = CentralDQNServer(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 999)
+
+        collectors = [
+            CollectorAgent(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 1000 + l)
+            for l in range(env_cfg.L)
+        ]
+
+        bits_per_transition = bits_raw_transition(env.obs_dim)
+
+        for t_round in range(fed_cfg.rounds):
+            # broadcast CPU->AP (não contamos)
+            theta = server.get_param_vector()
+            for c in collectors:
+                c.set_param_vector(theta)
+
+            obs_all = env.reset()
+            local_round_rewards = []
+
+            # coleta de dados brutos (sem treino local)
+            for _ in range(fed_cfg.local_episodes_per_round):
+                done = False
+                while not done:
+                    actions = [collectors[l].act(obs_all[l]) for l in range(env_cfg.L)]
+                    obs2_all, rewards_all, done, _info = env.step(actions)
+
+                    for l in range(env_cfg.L):
+                        collectors[l].store_transition(obs_all[l], actions[l], rewards_all[l], obs2_all[l], done)
+
+                    obs_all = obs2_all
+                    local_round_rewards.append(float(np.mean(rewards_all)))
+
+                    env_steps_total += 1
+
+            # uplink: enviar transições brutas AP->CPU
+            bits_this_round = 0
+            all_transitions = []
+            for c in collectors:
+                trans = c.pop_all_transitions()
+                all_transitions.extend(trans)
+                bits_this_round += len(trans) * bits_per_transition
+
+            total_uplink_bits += bits_this_round
+
+            # CPU ingere e treina centralmente
+            server.ingest_transitions(all_transitions)
+            server.train_steps(server_train_steps_per_round)
+
+            rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
+            round_rewards_mean.append(rr)
+
+            rewards_ma = moving_average(round_rewards_mean, ma_window)
+            r_ma = rewards_ma[-1] if rewards_ma else 0.0
+
+            if rounds_to_target is None and r_ma >= target_reward:
+                rounds_to_target = t_round + 1
+                total_uplink_bits_to_target = total_uplink_bits
+                env_steps_to_target = env_steps_total
+
+            if log_every > 0 and ((t_round + 1) % log_every == 0):
+                print(
+                    f"[fl_raw] round {t_round+1:04d}/{fed_cfg.rounds} "
+                    f"reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
+                    f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
+                    f"uplink_total={total_uplink_bits/1e6:.3f} Mbits"
+                )
+
+        rewards_ma = moving_average(round_rewards_mean, ma_window)
+        return {
+            "algo": "fl_raw",
+            "rounds": fed_cfg.rounds,
+            "hidden": hidden,
+            "comm_period": None,
+            "uplink_total_bits": int(total_uplink_bits),
+            "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
+            "rounds_to_target": rounds_to_target,
+            "env_steps_total": int(env_steps_total),
+            "env_steps_to_target": None if env_steps_to_target is None else int(env_steps_to_target),
+            "auc_rewards_ma": auc(rewards_ma),
+            "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
+        }
+
+    else:
+        raise ValueError("algo inválido")
+
+
+def print_summary(res: Dict, target_reward: float):
+    print("\n==================== RESULTADOS ====================")
+    print(f"Algo: {res['algo']}")
+    print(f"hidden: {res['hidden']}")
+    if res.get("comm_period", None) is not None:
+        print(f"comm_period (FRL): {res['comm_period']}")
+    print(f"Rounds: {res['rounds']}")
+    print(f"Rounds-to-target (MA >= {target_reward}): {res['rounds_to_target']}")
+    print(f"Env steps total: {res['env_steps_total']}")
+    print(f"Env steps to target: {res['env_steps_to_target']}")
+    print(f"Uplink total (AP->CPU): {res['uplink_total_bits']/1e6:.3f} Mbits")
+    if res["uplink_total_bits_to_target"] is None:
+        print("Uplink até target: None (não convergiu)")
+    else:
+        print(f"Uplink até target: {res['uplink_total_bits_to_target']/1e6:.3f} Mbits")
+    print(f"AUC(reward_ma): {res['auc_rewards_ma']:.3f}")
+    print(f"Last reward_MA: {res['last_reward_ma']:.3f}")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--algo", type=str, default="qgradual", choices=["qgradual", "fedavg", "fl"])
+
+    # single run or compare
+    ap.add_argument("--compare", action="store_true", help="Roda FRL (qgradual) e FL raw e compara")
+    ap.add_argument("--algo", type=str, default="qgradual", choices=["qgradual", "fedavg", "fl_raw"])
+
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
 
@@ -636,16 +776,19 @@ def main():
     ap.add_argument("--target_reward", type=float, default=4.0)
     ap.add_argument("--ma_window", type=int, default=10)
 
-    # comunicação
-    ap.add_argument("--comm_mode", type=str, default="topk_quant", choices=["none", "topk_quant"])
-    ap.add_argument("--topk_frac", type=float, default=0.02)      # 2% do vetor
-    ap.add_argument("--quant_bits", type=int, default=8)          # 8-bit
-    ap.add_argument("--upload_thresh", type=float, default=0.0)   # 0 => sempre envia
+    # modelos/comm
+    ap.add_argument("--hidden", type=int, default=64, help="Tamanho do hidden do QNetwork (impacta uplink do delta)")
+    ap.add_argument("--comm_period", type=int, default=3, help="FRL: envia delta a cada C rounds (sem compressão)")
 
-    # DQN knobs (pra você ajustar sem mexer no código)
+    # Só para fl_raw: quantos updates DQN a CPU faz por round com os dados recebidos
+    ap.add_argument("--server_train_steps_per_round", type=int, default=200)
+
+    # DQN knobs
     ap.add_argument("--start_learn", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--eps_decay_steps", type=int, default=8000)
+
+    ap.add_argument("--log_every", type=int, default=20)
 
     args = ap.parse_args()
 
@@ -666,40 +809,92 @@ def main():
         local_episodes_per_round=args.local_episodes_per_round,
     )
 
-    res = run_experiment(
-        algo=args.algo,
-        seed=args.seed,
-        env_cfg=env_cfg,
-        dqn_cfg=dqn_cfg,
-        fed_cfg=fed_cfg,
-        device=device,
-        target_reward=args.target_reward,
-        ma_window=args.ma_window,
-        comm_mode=args.comm_mode,
-        topk_frac=args.topk_frac,
-        quant_bits=args.quant_bits,
-        upload_thresh=args.upload_thresh,
-    )
+    if args.compare:
+        print("\n=== Rodando FRL-QGradual ===")
+        res_frl = run_experiment(
+            algo="qgradual",
+            seed=args.seed,
+            env_cfg=env_cfg,
+            dqn_cfg=dqn_cfg,
+            fed_cfg=fed_cfg,
+            device=device,
+            hidden=args.hidden,
+            comm_period=args.comm_period,
+            target_reward=args.target_reward,
+            ma_window=args.ma_window,
+            server_train_steps_per_round=args.server_train_steps_per_round,
+            log_every=args.log_every,
+        )
+        print_summary(res_frl, args.target_reward)
 
-    print("\n==================== RESULTADOS ====================")
-    print(f"Algo (cliente): {res['algo_client']}")
-    print(f"Algo (servidor): {res['algo_server']}")
-    print(f"Comm: {res['comm_mode']} | topk={res['topk_frac']*100:.2f}% | q={res['quant_bits']} bits | thresh={res['upload_thresh']}")
-    print(f"Rounds: {res['rounds']}")
-    print(f"Rounds-to-target (MA >= {args.target_reward}): {res['rounds_to_target']}")
-    print(f"Uplink total: {res['uplink_total_bits']/1e6:.2f} Mbits")
-    if res["uplink_total_bits_to_target"] is None:
-        print("Uplink até target: None (não convergiu)")
+        print("\n=== Rodando FL clássico (dados brutos) ===")
+        res_fl = run_experiment(
+            algo="fl_raw",
+            seed=args.seed,
+            env_cfg=env_cfg,
+            dqn_cfg=dqn_cfg,
+            fed_cfg=fed_cfg,
+            device=device,
+            hidden=args.hidden,
+            comm_period=args.comm_period,  # não usado no fl_raw
+            target_reward=args.target_reward,
+            ma_window=args.ma_window,
+            server_train_steps_per_round=args.server_train_steps_per_round,
+            log_every=args.log_every,
+        )
+        print_summary(res_fl, args.target_reward)
+
+        # comparação direta
+        print("\n==================== COMPARAÇÃO ====================")
+        # Uplink
+        if res_frl["uplink_total_bits_to_target"] is not None and res_fl["uplink_total_bits_to_target"] is not None:
+            ratio = res_frl["uplink_total_bits_to_target"] / max(1, res_fl["uplink_total_bits_to_target"])
+            print(f"Uplink até target (FRL / FL_raw): {ratio:.3f}x  (menor é melhor)")
+        else:
+            print("Uplink até target: não disponível para um dos métodos (não convergiu).")
+
+        # Velocidade por rounds
+        if res_frl["rounds_to_target"] is not None and res_fl["rounds_to_target"] is not None:
+            print(f"Rounds-to-target: FRL={res_frl['rounds_to_target']} | FL_raw={res_fl['rounds_to_target']} (menor é melhor)")
+        else:
+            print("Rounds-to-target: não disponível para um dos métodos (não convergiu).")
+
+        # Velocidade por env steps
+        if res_frl["env_steps_to_target"] is not None and res_fl["env_steps_to_target"] is not None:
+            print(f"Env-steps-to-target: FRL={res_frl['env_steps_to_target']} | FL_raw={res_fl['env_steps_to_target']} (menor é melhor)")
+        else:
+            print("Env-steps-to-target: não disponível para um dos métodos (não convergiu).")
+
+        print("\nComandos exemplo:")
+        print("  # Comparar os dois automaticamente:")
+        print("  python frl_qgradual_cellfree.py --compare --hidden 64 --comm_period 3")
+        print("  # Rodar só FRL-QGradual:")
+        print("  python frl_qgradual_cellfree.py --algo qgradual --hidden 64 --comm_period 3")
+        print("  # Rodar só FL clássico (dados brutos):")
+        print("  python frl_qgradual_cellfree.py --algo fl_raw --hidden 64 --server_train_steps_per_round 200")
+
     else:
-        print(f"Uplink até target: {res['uplink_total_bits_to_target']/1e6:.2f} Mbits")
-    print(f"AUC(reward_ma): {res['auc_rewards_ma']:.3f}")
-    print(f"Last reward_MA: {res['last_reward_ma']:.3f}")
+        res = run_experiment(
+            algo=args.algo,
+            seed=args.seed,
+            env_cfg=env_cfg,
+            dqn_cfg=dqn_cfg,
+            fed_cfg=fed_cfg,
+            device=device,
+            hidden=args.hidden,
+            comm_period=args.comm_period,
+            target_reward=args.target_reward,
+            ma_window=args.ma_window,
+            server_train_steps_per_round=args.server_train_steps_per_round,
+            log_every=args.log_every,
+        )
+        print_summary(res, args.target_reward)
 
-    print("\nSugestão de comparação (mesmos parâmetros):")
-    print("  # baseline FL (sem compressão):")
-    print("  python frl_qgradual_cellfree.py --algo fl --comm_mode none")
-    print("  # FRL-QGradual com compressão e (opcional) gatilho:")
-    print("  python frl_qgradual_cellfree.py --algo qgradual --comm_mode topk_quant --topk_frac 0.02 --quant_bits 8 --upload_thresh 0.0")
+        print("\nComandos sugeridos:")
+        print("  # FRL-QGradual (uplink delta a cada comm_period rounds):")
+        print("  python frl_qgradual_cellfree.py --algo qgradual --hidden 64 --comm_period 3")
+        print("  # FL clássico com dados brutos:")
+        print("  python frl_qgradual_cellfree.py --algo fl_raw --hidden 64 --server_train_steps_per_round 200")
 
 
 if __name__ == "__main__":
