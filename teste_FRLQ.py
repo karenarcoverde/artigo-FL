@@ -1,15 +1,15 @@
-# frl_qgradual_cellfree.py
+# frl_qgradual_vs_fedavg_cellfree.py
 # ============================================================
-# Comparação (toy Cell-Free):
-#   (A) FRL-QGradual / FRL-FedAvg:
-#       - Cada AP treina um DQN localmente
+# Comparação (toy Cell-Free) APENAS:
+#   (A) FRL-QGradual:
+#       - Cada AP treina um DQN localmente (ReplayBuffer + TD loss)
 #       - Uplink AP->CPU: DELTA de parâmetros (float32) SOMENTE a cada comm_period rounds
-#         (sem top-k / sem quantização)
+#       - Agregação: theta <- theta + wt(t) * mean(delta), com wt(t)>1 após warmup e decresce até 1
 #
-#   (B) "FL clássico com dados brutos" (fl_raw):
-#       - APs NÃO treinam (só executam a política global + epsilon-greedy)
-#       - Uplink AP->CPU: TRANSIÇÕES brutas (s,a,r,s2,done)
-#       - CPU treina um DQN centralizado
+#   (B) FL clássico (FedAvg):
+#       - Cada AP treina um DQN localmente (mesma coisa)
+#       - Uplink AP->CPU: DELTA de parâmetros (float32) SOMENTE a cada comm_period rounds
+#       - Agregação: theta <- theta + 1.0 * mean(delta)
 #
 # Métricas:
 #   - rounds_to_target (reward moving-average >= target_reward)
@@ -131,7 +131,7 @@ class CellFreeToyEnv:
         self.h = None
 
         self.n_actions = cfg.K * len(cfg.power_levels)
-        self.obs_dim = cfg.K + cfg.K + 1
+        self.obs_dim = cfg.K + cfg.K + 1  # beta[l] (K) + queues norm (K) + step_norm (1)
 
     def _compute_pathloss(self, ap_pos, ue_pos, expn):
         d = np.linalg.norm(ap_pos[:, None, :] - ue_pos[None, :, :], axis=2) + 1e-3
@@ -228,7 +228,7 @@ class DQNConfig:
 
 
 # -------------------------
-# FRL: agente DQN local (treina local)
+# Agente DQN local (treina local)
 # -------------------------
 class DQNAgent:
     def __init__(
@@ -310,64 +310,7 @@ class DQNAgent:
 
 
 # -------------------------
-# "FL clássico com dados brutos": AP é coletor (não treina)
-# -------------------------
-class CollectorAgent:
-    """
-    Coleta transições e faz uplink de dados brutos (s,a,r,s2,done).
-    Não treina localmente; só executa a política global (broadcast) + epsilon-greedy.
-    """
-
-    def __init__(
-        self,
-        obs_dim: int,
-        n_actions: int,
-        hidden: int,
-        cfg: DQNConfig,
-        device: torch.device,
-        seed: int,
-    ):
-        self.obs_dim = obs_dim
-        self.n_actions = n_actions
-        self.hidden = hidden
-        self.cfg = cfg
-        self.device = device
-        self.rng = np.random.default_rng(seed)
-
-        self.q = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
-        self.total_steps = 0
-        self.transitions = []  # lista de (s,a,r,s2,done)
-
-    def epsilon(self):
-        cfg = self.cfg
-        t = min(self.total_steps, cfg.eps_decay_steps)
-        eps = cfg.eps_start + (cfg.eps_end - cfg.eps_start) * (t / cfg.eps_decay_steps)
-        return float(eps)
-
-    @torch.no_grad()
-    def act(self, obs: np.ndarray):
-        eps = self.epsilon()
-        self.total_steps += 1
-        if self.rng.random() < eps:
-            return int(self.rng.integers(0, self.n_actions))
-        x = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        qvals = self.q(x)
-        return int(torch.argmax(qvals, dim=1).item())
-
-    def store_transition(self, s, a, r, s2, done):
-        self.transitions.append((s, a, r, s2, done))
-
-    def pop_all_transitions(self):
-        out = self.transitions
-        self.transitions = []
-        return out
-
-    def set_param_vector(self, vec: torch.Tensor):
-        vector_to_parameters(vec.detach().clone(), self.q.parameters())
-
-
-# -------------------------
-# Servidor federado (FRL): agrega deltas com wt (QGradual) ou wt=1 (FedAvg)
+# Servidor federado: agrega deltas com wt (QGradual) ou wt=1 (FedAvg)
 # -------------------------
 @dataclass
 class FedConfig:
@@ -389,7 +332,6 @@ class FedServer:
         self.w0 = float(math.log(n_agents) + 1.0)
 
     def weight_wt(self, t_round: int) -> float:
-        # warmup: durante as primeiras rodadas, wt=1 (estabiliza)
         if t_round < int(self.fedcfg.warmup_rounds):
             return 1.0
         if self.algo == "fedavg":
@@ -408,74 +350,6 @@ class FedServer:
         agg = torch.clamp(agg, self.fedcfg.vmin, self.fedcfg.vmax)
         self.theta = self.theta + agg
         return agg
-
-
-# -------------------------
-# Servidor central (fl_raw): treina DQN global com transições brutas recebidas
-# -------------------------
-class CentralDQNServer:
-    def __init__(
-        self,
-        obs_dim: int,
-        n_actions: int,
-        hidden: int,
-        cfg: DQNConfig,
-        device: torch.device,
-        seed: int,
-    ):
-        self.obs_dim = obs_dim
-        self.n_actions = n_actions
-        self.hidden = hidden
-        self.cfg = cfg
-        self.device = device
-        self.rng = np.random.default_rng(seed)
-
-        self.q = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
-        self.q_tgt = QNetwork(obs_dim, n_actions, hidden=hidden).to(device)
-        self.q_tgt.load_state_dict(self.q.state_dict())
-
-        self.opt = optim.Adam(self.q.parameters(), lr=cfg.lr)
-        self.rb = ReplayBuffer(cfg.buffer_size, obs_dim, device)
-        self.total_steps = 0
-
-    def get_param_vector(self) -> torch.Tensor:
-        return parameters_to_vector(self.q.parameters()).detach().clone()
-
-    def ingest_transitions(self, transitions: List[tuple]):
-        for (s, a, r, s2, done) in transitions:
-            self.rb.add(s, a, r, s2, done)
-
-    def train_steps(self, n_steps: int) -> float:
-        cfg = self.cfg
-        if self.rb.size < cfg.start_learn:
-            return 0.0
-
-        losses = []
-        for _ in range(n_steps):
-            self.total_steps += 1
-            if (self.total_steps % cfg.train_freq) != 0:
-                continue
-
-            s, a, r, s2, d = self.rb.sample(cfg.batch_size)
-
-            with torch.no_grad():
-                next_a = torch.argmax(self.q(s2), dim=1, keepdim=True)
-                next_q = self.q_tgt(s2).gather(1, next_a)
-                y = r + cfg.gamma * (1.0 - d) * next_q
-
-            qsa = self.q(s).gather(1, a)
-            loss = nn.functional.smooth_l1_loss(qsa, y)
-
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.q.parameters(), cfg.grad_clip_norm)
-            self.opt.step()
-            losses.append(float(loss.item()))
-
-            if (self.total_steps % cfg.target_update) == 0:
-                self.q_tgt.load_state_dict(self.q.state_dict())
-
-        return float(np.mean(losses)) if losses else 0.0
 
 
 # -------------------------
@@ -501,27 +375,14 @@ def auc(y: List[float]) -> float:
 
 
 # -------------------------
-# Contagem de bits (uplink AP->CPU)
+# Contagem de bits (uplink AP->CPU): delta de parâmetros float32
 # -------------------------
 def bits_delta_params_float32(n_params: int) -> int:
     return int(n_params) * 32
 
 
-def bits_raw_transition(obs_dim: int) -> int:
-    """
-    Transição bruta: (s, a, r, s2, done)
-      s   : obs_dim float32
-      s2  : obs_dim float32
-      a   : int32  (32 bits)
-      r   : float32
-      done: int32  (32 bits)
-    Total bits = (2*obs_dim + 3) * 32
-    """
-    return (2 * int(obs_dim) + 3) * 32
-
-
 # -------------------------
-# Loop principal
+# Loop principal (somente qgradual/fedavg)
 # -------------------------
 def run_experiment(
     algo: str,
@@ -534,15 +395,15 @@ def run_experiment(
     comm_period: int,
     target_reward: float,
     ma_window: int,
-    server_train_steps_per_round: int,
     log_every: int = 20,
 ) -> Dict:
     """
     algo:
-      - "qgradual": FRL-QGradual (uplink = delta parâmetros, comm_period)
-      - "fedavg"  : FRL-FedAvg   (uplink = delta parâmetros, comm_period)
-      - "fl_raw"  : "FL clássico" com dados brutos (uplink = transições)
+      - "qgradual": FRL-QGradual (uplink = delta parâmetros, comm_period, agregação wt(t))
+      - "fedavg"  : FL clássico (FedAvg) (uplink = delta parâmetros, comm_period, agregação wt=1)
     """
+    assert algo in ("qgradual", "fedavg")
+
     set_seeds(seed)
     env = CellFreeToyEnv(env_cfg, seed=seed)
 
@@ -554,193 +415,100 @@ def run_experiment(
     env_steps_total = 0
     env_steps_to_target: Optional[int] = None
 
-    if algo in ("qgradual", "fedavg"):
-        # ---------------- FRL ----------------
-        agents = [
-            DQNAgent(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 1000 + l)
-            for l in range(env_cfg.L)
-        ]
-        theta0 = agents[0].get_param_vector()
-        server = FedServer(theta0, n_agents=env_cfg.L, fedcfg=fed_cfg, algo=algo)
+    agents = [
+        DQNAgent(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 1000 + l)
+        for l in range(env_cfg.L)
+    ]
+    theta0 = agents[0].get_param_vector()
+    server = FedServer(theta0, n_agents=env_cfg.L, fedcfg=fed_cfg, algo=algo)
 
+    for ag in agents:
+        ag.set_param_vector(server.theta)
+
+    n_params = int(server.theta.numel())
+    comm_period = max(1, int(comm_period))
+
+    for t_round in range(fed_cfg.rounds):
+        # broadcast CPU->AP (não contamos)
         for ag in agents:
             ag.set_param_vector(server.theta)
 
-        n_params = int(server.theta.numel())
-        comm_period = max(1, int(comm_period))
+        obs_all = env.reset()
+        local_round_rewards = []
 
-        for t_round in range(fed_cfg.rounds):
-            # broadcast CPU->AP (não contamos)
+        # local episodes: AP treina DQN local
+        for _ in range(fed_cfg.local_episodes_per_round):
+            done = False
+            while not done:
+                actions = [agents[l].act(obs_all[l]) for l in range(env_cfg.L)]
+                obs2_all, rewards_all, done, _info = env.step(actions)
+
+                for l in range(env_cfg.L):
+                    agents[l].store(obs_all[l], actions[l], rewards_all[l], obs2_all[l], done)
+                    agents[l].maybe_train()
+
+                obs_all = obs2_all
+                local_round_rewards.append(float(np.mean(rewards_all)))
+
+                env_steps_total += 1
+
+        # uplink: deltas SOMENTE quando do_comm=True
+        do_comm = ((t_round % comm_period) == 0)
+        deltas_to_server = []
+        bits_this_round = 0
+
+        if do_comm:
             for ag in agents:
-                ag.set_param_vector(server.theta)
-
-            obs_all = env.reset()
-            local_round_rewards = []
-
-            # local episodes: AP treina DQN local
-            for _ in range(fed_cfg.local_episodes_per_round):
-                done = False
-                while not done:
-                    actions = [agents[l].act(obs_all[l]) for l in range(env_cfg.L)]
-                    obs2_all, rewards_all, done, _info = env.step(actions)
-
-                    for l in range(env_cfg.L):
-                        agents[l].store(obs_all[l], actions[l], rewards_all[l], obs2_all[l], done)
-                        agents[l].maybe_train()
-
-                    obs_all = obs2_all
-                    local_round_rewards.append(float(np.mean(rewards_all)))
-
-                    # conta env steps (um step do ambiente por tempo, independente de L)
-                    env_steps_total += 1
-
-            # uplink: deltas SOMENTE quando do_comm=True
-            do_comm = ((t_round % comm_period) == 0)
-            deltas_to_server = []
-            bits_this_round = 0
-
-            if do_comm:
-                for ag in agents:
-                    theta_k = ag.get_param_vector()
-                    delta = theta_k - server.theta
-                    deltas_to_server.append(delta)
-                    bits_this_round += bits_delta_params_float32(n_params)
-
-                total_uplink_bits += bits_this_round
-                server.aggregate(deltas_to_server, t_round=t_round)
-            else:
-                # sem comunicação: nada enviado, modelo global não muda
-                bits_this_round = 0
-
-            rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
-            round_rewards_mean.append(rr)
-
-            rewards_ma = moving_average(round_rewards_mean, ma_window)
-            r_ma = rewards_ma[-1] if rewards_ma else 0.0
-
-            if rounds_to_target is None and r_ma >= target_reward:
-                rounds_to_target = t_round + 1
-                total_uplink_bits_to_target = total_uplink_bits
-                env_steps_to_target = env_steps_total
-
-            if log_every > 0 and ((t_round + 1) % log_every == 0):
-                wt = server.weight_wt(t_round)
-                print(
-                    f"[{algo}] round {t_round+1:04d}/{fed_cfg.rounds} "
-                    f"comm={'Y' if do_comm else 'N'} wt={wt:.3f} "
-                    f"reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
-                    f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
-                    f"uplink_total={total_uplink_bits/1e6:.3f} Mbits"
-                )
-
-        rewards_ma = moving_average(round_rewards_mean, ma_window)
-        return {
-            "algo": algo,
-            "rounds": fed_cfg.rounds,
-            "hidden": hidden,
-            "comm_period": comm_period,
-            "uplink_total_bits": int(total_uplink_bits),
-            "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
-            "rounds_to_target": rounds_to_target,
-            "env_steps_total": int(env_steps_total),
-            "env_steps_to_target": None if env_steps_to_target is None else int(env_steps_to_target),
-            "auc_rewards_ma": auc(rewards_ma),
-            "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
-        }
-
-    elif algo == "fl_raw":
-        # ---------------- FL RAW (dados brutos) ----------------
-        server = CentralDQNServer(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 999)
-
-        collectors = [
-            CollectorAgent(env.obs_dim, env.n_actions, hidden, dqn_cfg, device, seed=seed + 1000 + l)
-            for l in range(env_cfg.L)
-        ]
-
-        bits_per_transition = bits_raw_transition(env.obs_dim)
-
-        for t_round in range(fed_cfg.rounds):
-            # broadcast CPU->AP (não contamos)
-            theta = server.get_param_vector()
-            for c in collectors:
-                c.set_param_vector(theta)
-
-            obs_all = env.reset()
-            local_round_rewards = []
-
-            # coleta de dados brutos (sem treino local)
-            for _ in range(fed_cfg.local_episodes_per_round):
-                done = False
-                while not done:
-                    actions = [collectors[l].act(obs_all[l]) for l in range(env_cfg.L)]
-                    obs2_all, rewards_all, done, _info = env.step(actions)
-
-                    for l in range(env_cfg.L):
-                        collectors[l].store_transition(obs_all[l], actions[l], rewards_all[l], obs2_all[l], done)
-
-                    obs_all = obs2_all
-                    local_round_rewards.append(float(np.mean(rewards_all)))
-
-                    env_steps_total += 1
-
-            # uplink: enviar transições brutas AP->CPU
-            bits_this_round = 0
-            all_transitions = []
-            for c in collectors:
-                trans = c.pop_all_transitions()
-                all_transitions.extend(trans)
-                bits_this_round += len(trans) * bits_per_transition
+                theta_k = ag.get_param_vector()
+                delta = theta_k - server.theta
+                deltas_to_server.append(delta)
+                bits_this_round += bits_delta_params_float32(n_params)
 
             total_uplink_bits += bits_this_round
+            server.aggregate(deltas_to_server, t_round=t_round)
 
-            # CPU ingere e treina centralmente
-            server.ingest_transitions(all_transitions)
-            server.train_steps(server_train_steps_per_round)
-
-            rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
-            round_rewards_mean.append(rr)
-
-            rewards_ma = moving_average(round_rewards_mean, ma_window)
-            r_ma = rewards_ma[-1] if rewards_ma else 0.0
-
-            if rounds_to_target is None and r_ma >= target_reward:
-                rounds_to_target = t_round + 1
-                total_uplink_bits_to_target = total_uplink_bits
-                env_steps_to_target = env_steps_total
-
-            if log_every > 0 and ((t_round + 1) % log_every == 0):
-                print(
-                    f"[fl_raw] round {t_round+1:04d}/{fed_cfg.rounds} "
-                    f"reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
-                    f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
-                    f"uplink_total={total_uplink_bits/1e6:.3f} Mbits"
-                )
+        rr = float(np.mean(local_round_rewards)) if local_round_rewards else 0.0
+        round_rewards_mean.append(rr)
 
         rewards_ma = moving_average(round_rewards_mean, ma_window)
-        return {
-            "algo": "fl_raw",
-            "rounds": fed_cfg.rounds,
-            "hidden": hidden,
-            "comm_period": None,
-            "uplink_total_bits": int(total_uplink_bits),
-            "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
-            "rounds_to_target": rounds_to_target,
-            "env_steps_total": int(env_steps_total),
-            "env_steps_to_target": None if env_steps_to_target is None else int(env_steps_to_target),
-            "auc_rewards_ma": auc(rewards_ma),
-            "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
-        }
+        r_ma = rewards_ma[-1] if rewards_ma else 0.0
 
-    else:
-        raise ValueError("algo inválido")
+        if rounds_to_target is None and r_ma >= target_reward:
+            rounds_to_target = t_round + 1
+            total_uplink_bits_to_target = total_uplink_bits
+            env_steps_to_target = env_steps_total
+
+        if log_every > 0 and ((t_round + 1) % log_every == 0):
+            wt = server.weight_wt(t_round)
+            print(
+                f"[{algo}] round {t_round+1:04d}/{fed_cfg.rounds} "
+                f"comm={'Y' if do_comm else 'N'} wt={wt:.3f} "
+                f"reward_mean={rr:.3f} reward_MA({ma_window})={r_ma:.3f} "
+                f"uplink_this_round={bits_this_round/1e6:.3f} Mbits "
+                f"uplink_total={total_uplink_bits/1e6:.3f} Mbits"
+            )
+
+    rewards_ma = moving_average(round_rewards_mean, ma_window)
+    return {
+        "algo": algo,
+        "rounds": fed_cfg.rounds,
+        "hidden": hidden,
+        "comm_period": comm_period,
+        "uplink_total_bits": int(total_uplink_bits),
+        "uplink_total_bits_to_target": None if total_uplink_bits_to_target is None else int(total_uplink_bits_to_target),
+        "rounds_to_target": rounds_to_target,
+        "env_steps_total": int(env_steps_total),
+        "env_steps_to_target": None if env_steps_to_target is None else int(env_steps_to_target),
+        "auc_rewards_ma": auc(rewards_ma),
+        "last_reward_ma": float(rewards_ma[-1]) if rewards_ma else 0.0,
+    }
 
 
 def print_summary(res: Dict, target_reward: float):
     print("\n==================== RESULTADOS ====================")
     print(f"Algo: {res['algo']}")
     print(f"hidden: {res['hidden']}")
-    if res.get("comm_period", None) is not None:
-        print(f"comm_period (FRL): {res['comm_period']}")
+    print(f"comm_period: {res['comm_period']}")
     print(f"Rounds: {res['rounds']}")
     print(f"Rounds-to-target (MA >= {target_reward}): {res['rounds_to_target']}")
     print(f"Env steps total: {res['env_steps_total']}")
@@ -757,9 +525,8 @@ def print_summary(res: Dict, target_reward: float):
 def main():
     ap = argparse.ArgumentParser()
 
-    # single run or compare
-    ap.add_argument("--compare", action="store_true", help="Roda FRL (qgradual) e FL raw e compara")
-    ap.add_argument("--algo", type=str, default="qgradual", choices=["qgradual", "fedavg", "fl_raw"])
+    ap.add_argument("--compare", action="store_true", help="Roda FedAvg e QGradual e compara")
+    ap.add_argument("--algo", type=str, default="qgradual", choices=["qgradual", "fedavg"])
 
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
@@ -776,14 +543,9 @@ def main():
     ap.add_argument("--target_reward", type=float, default=4.0)
     ap.add_argument("--ma_window", type=int, default=10)
 
-    # modelos/comm
-    ap.add_argument("--hidden", type=int, default=64, help="Tamanho do hidden do QNetwork (impacta uplink do delta)")
-    ap.add_argument("--comm_period", type=int, default=3, help="FRL: envia delta a cada C rounds (sem compressão)")
+    ap.add_argument("--hidden", type=int, default=64, help="Hidden do QNetwork (impacta uplink do delta)")
+    ap.add_argument("--comm_period", type=int, default=3, help="Envia delta a cada C rounds (sem compressão)")
 
-    # Só para fl_raw: quantos updates DQN a CPU faz por round com os dados recebidos
-    ap.add_argument("--server_train_steps_per_round", type=int, default=200)
-
-    # DQN knobs
     ap.add_argument("--start_learn", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--eps_decay_steps", type=int, default=8000)
@@ -810,8 +572,24 @@ def main():
     )
 
     if args.compare:
+        print("\n=== Rodando FL clássico (FedAvg) ===")
+        res_fed = run_experiment(
+            algo="fedavg",
+            seed=args.seed,
+            env_cfg=env_cfg,
+            dqn_cfg=dqn_cfg,
+            fed_cfg=fed_cfg,
+            device=device,
+            hidden=args.hidden,
+            comm_period=args.comm_period,
+            target_reward=args.target_reward,
+            ma_window=args.ma_window,
+            log_every=args.log_every,
+        )
+        print_summary(res_fed, args.target_reward)
+
         print("\n=== Rodando FRL-QGradual ===")
-        res_frl = run_experiment(
+        res_qg = run_experiment(
             algo="qgradual",
             seed=args.seed,
             env_cfg=env_cfg,
@@ -822,56 +600,34 @@ def main():
             comm_period=args.comm_period,
             target_reward=args.target_reward,
             ma_window=args.ma_window,
-            server_train_steps_per_round=args.server_train_steps_per_round,
             log_every=args.log_every,
         )
-        print_summary(res_frl, args.target_reward)
+        print_summary(res_qg, args.target_reward)
 
-        print("\n=== Rodando FL clássico (dados brutos) ===")
-        res_fl = run_experiment(
-            algo="fl_raw",
-            seed=args.seed,
-            env_cfg=env_cfg,
-            dqn_cfg=dqn_cfg,
-            fed_cfg=fed_cfg,
-            device=device,
-            hidden=args.hidden,
-            comm_period=args.comm_period,  # não usado no fl_raw
-            target_reward=args.target_reward,
-            ma_window=args.ma_window,
-            server_train_steps_per_round=args.server_train_steps_per_round,
-            log_every=args.log_every,
-        )
-        print_summary(res_fl, args.target_reward)
-
-        # comparação direta
         print("\n==================== COMPARAÇÃO ====================")
-        # Uplink
-        if res_frl["uplink_total_bits_to_target"] is not None and res_fl["uplink_total_bits_to_target"] is not None:
-            ratio = res_frl["uplink_total_bits_to_target"] / max(1, res_fl["uplink_total_bits_to_target"])
-            print(f"Uplink até target (FRL / FL_raw): {ratio:.3f}x  (menor é melhor)")
+        if res_fed["uplink_total_bits_to_target"] is not None and res_qg["uplink_total_bits_to_target"] is not None:
+            ratio = res_qg["uplink_total_bits_to_target"] / max(1, res_fed["uplink_total_bits_to_target"])
+            print(f"Uplink até target (QGradual / FedAvg): {ratio:.3f}x  (menor é melhor)")
         else:
             print("Uplink até target: não disponível para um dos métodos (não convergiu).")
 
-        # Velocidade por rounds
-        if res_frl["rounds_to_target"] is not None and res_fl["rounds_to_target"] is not None:
-            print(f"Rounds-to-target: FRL={res_frl['rounds_to_target']} | FL_raw={res_fl['rounds_to_target']} (menor é melhor)")
+        if res_fed["rounds_to_target"] is not None and res_qg["rounds_to_target"] is not None:
+            print(f"Rounds-to-target: FedAvg={res_fed['rounds_to_target']} | QGradual={res_qg['rounds_to_target']} (menor é melhor)")
         else:
             print("Rounds-to-target: não disponível para um dos métodos (não convergiu).")
 
-        # Velocidade por env steps
-        if res_frl["env_steps_to_target"] is not None and res_fl["env_steps_to_target"] is not None:
-            print(f"Env-steps-to-target: FRL={res_frl['env_steps_to_target']} | FL_raw={res_fl['env_steps_to_target']} (menor é melhor)")
+        if res_fed["env_steps_to_target"] is not None and res_qg["env_steps_to_target"] is not None:
+            print(f"Env-steps-to-target: FedAvg={res_fed['env_steps_to_target']} | QGradual={res_qg['env_steps_to_target']} (menor é melhor)")
         else:
             print("Env-steps-to-target: não disponível para um dos métodos (não convergiu).")
 
         print("\nComandos exemplo:")
-        print("  # Comparar os dois automaticamente:")
-        print("  python frl_qgradual_cellfree.py --compare --hidden 64 --comm_period 3")
-        print("  # Rodar só FRL-QGradual:")
-        print("  python frl_qgradual_cellfree.py --algo qgradual --hidden 64 --comm_period 3")
-        print("  # Rodar só FL clássico (dados brutos):")
-        print("  python frl_qgradual_cellfree.py --algo fl_raw --hidden 64 --server_train_steps_per_round 200")
+        print("  # Comparar automaticamente:")
+        print("  python frl_qgradual_vs_fedavg_cellfree.py --compare --hidden 64 --comm_period 3")
+        print("  # Rodar só FedAvg:")
+        print("  python frl_qgradual_vs_fedavg_cellfree.py --algo fedavg --hidden 64 --comm_period 3")
+        print("  # Rodar só QGradual:")
+        print("  python frl_qgradual_vs_fedavg_cellfree.py --algo qgradual --hidden 64 --comm_period 3")
 
     else:
         res = run_experiment(
@@ -885,16 +641,9 @@ def main():
             comm_period=args.comm_period,
             target_reward=args.target_reward,
             ma_window=args.ma_window,
-            server_train_steps_per_round=args.server_train_steps_per_round,
             log_every=args.log_every,
         )
         print_summary(res, args.target_reward)
-
-        print("\nComandos sugeridos:")
-        print("  # FRL-QGradual (uplink delta a cada comm_period rounds):")
-        print("  python frl_qgradual_cellfree.py --algo qgradual --hidden 64 --comm_period 3")
-        print("  # FL clássico com dados brutos:")
-        print("  python frl_qgradual_cellfree.py --algo fl_raw --hidden 64 --server_train_steps_per_round 200")
 
 
 if __name__ == "__main__":
